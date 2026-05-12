@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import multiprocessing.connection
+import signal
 import threading
 import time
 import weakref
@@ -198,30 +199,119 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
         return processes, result_handle
 
+    @staticmethod
+    def _format_worker_exit(process: mp.Process) -> str:
+        """Return a human-readable description for a worker process exit."""
+        exitcode = process.exitcode
+        if exitcode is None:
+            return "still running or exitcode not collected yet"
+        if exitcode < 0:
+            signum = -exitcode
+            try:
+                signame = signal.Signals(signum).name
+            except ValueError:
+                signame = f"SIG{signum}"
+            hint = ""
+            if signum == signal.SIGKILL:
+                hint = " (SIGKILL: often OOM killer or external kill; Python traceback is unavailable)"
+            elif signum == signal.SIGSEGV:
+                hint = " (SIGSEGV: native/CUDA crash; check faulthandler output above)"
+            elif signum == signal.SIGABRT:
+                hint = " (SIGABRT: process aborted; check native/CUDA/runtime logs above)"
+            return f"terminated by signal {signum} ({signame}){hint}"
+        if exitcode == 0:
+            return "exited with code 0 (unexpected normal exit)"
+        return f"exited with code {exitcode}; check worker traceback above"
+
+    # Seconds to wait for a worker process to actually reap after its
+    # sentinel is signaled. A real death is always reapable within this
+    # budget; anything longer is treated as a spurious wake-up.
+    _SENTINEL_CONFIRM_TIMEOUT_S = 2.0
+
     def start_worker_monitor(self) -> None:
         # Monitors worker process liveness. If any die unexpectedly,
         # logs an error, shuts down the executor and invokes the failure
         # callback to inform the engine.
-        sentinels = [p.sentinel for p in self._processes]
-        if not sentinels:
+        #
+        # NOTE: multiprocessing.connection.wait(sentinels) can return
+        # spuriously on Linux when an unrelated sibling process (e.g. a
+        # newly spawned Ray actor) inherits and closes the sentinel pipe
+        # fd. To avoid falsely declaring a healthy worker dead we confirm
+        # death by polling ``process.exitcode`` with a short timeout; if
+        # the worker is still alive we resume waiting.
+        processes_snapshot = list(self._processes)
+        if not processes_snapshot:
             return
 
+        sentinel_to_process = {p.sentinel: p for p in processes_snapshot}
+
         def _monitor() -> None:
-            try:
-                finished = multiprocessing.connection.wait(sentinels)
-            except OSError:
-                return
+            while True:
+                if self._closed:
+                    return
 
-            if self._closed:
-                return
+                # Rebuild the sentinel list every iteration because we
+                # may have confirmed some processes are still alive.
+                current_sentinels = [
+                    p.sentinel for p in processes_snapshot if p.exitcode is None
+                ]
+                if not current_sentinels:
+                    # All workers have exited and been reaped already.
+                    break
 
-            dead = [p.name for p in self._processes if p.sentinel in finished]
-            if dead:
+                try:
+                    finished = multiprocessing.connection.wait(current_sentinels)
+                except OSError:
+                    return
+
+                if self._closed:
+                    return
+
+                # Confirm death: a true exit is reapable almost immediately
+                # after sentinel fires. Spurious wake-ups leave exitcode=None.
+                confirmed_dead: list[mp.Process] = []
+                for sentinel in finished:
+                    process = sentinel_to_process.get(sentinel)
+                    if process is None:
+                        continue
+                    process.join(timeout=self._SENTINEL_CONFIRM_TIMEOUT_S)
+                    if process.exitcode is None:
+                        logger.warning(
+                            "Diffusion worker monitor: sentinel for %s (pid=%s) "
+                            "fired but exitcode is still None after %.1fs; "
+                            "treating as spurious wake-up (likely caused by a "
+                            "sibling process inheriting and closing the sentinel "
+                            "fd) and resuming wait.",
+                            process.name,
+                            process.pid,
+                            self._SENTINEL_CONFIRM_TIMEOUT_S,
+                        )
+                        continue
+                    confirmed_dead.append(process)
+
+                if not confirmed_dead:
+                    # Go back to waiting on the still-alive workers.
+                    continue
+
+                dead_names = [p.name for p in confirmed_dead]
                 logger.error(
                     "Diffusion worker(s) died unexpectedly: %s",
-                    dead,
+                    dead_names,
                 )
+                for process in confirmed_dead:
+                    logger.error(
+                        "Diffusion worker exit detail: name=%s pid=%s "
+                        "exitcode=%s reason=%s",
+                        process.name,
+                        process.pid,
+                        process.exitcode,
+                        self._format_worker_exit(process),
+                    )
                 self.is_failed = True
+                break
+
+            if not self.is_failed:
+                return
 
             self.shutdown()
 

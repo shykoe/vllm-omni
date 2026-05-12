@@ -8,9 +8,11 @@ Handles GPU infrastructure initialization and delegates model operations
 to DiffusionModelRunner.
 """
 
+import faulthandler
 import gc
 import multiprocessing as mp
 import os
+import sys
 from collections.abc import Iterable
 from contextlib import AbstractContextManager, nullcontext
 from types import SimpleNamespace
@@ -702,24 +704,61 @@ class WorkerProc:
         """Worker initialization and execution loops."""
         from vllm_omni.plugins import load_omni_general_plugins
 
-        load_omni_general_plugins()
-        worker_proc = WorkerProc(
-            od_config,
-            gpu_id=rank,
-            broadcast_handle=broadcast_handle,
-            wake_event=wake_event,
-            worker_extension_cls=worker_extension_cls,
-            custom_pipeline_args=custom_pipeline_args,
-        )
-        logger.info(f"Worker {rank}: Scheduler loop started.")
-        pipe_writer.send(
-            {
-                "status": "ready",
-                "result_handle": worker_proc.result_mq_handle if rank == 0 else None,
-            }
-        )
-        worker_proc.worker_busy_loop()
-        logger.info(f"Worker {rank}: Shutdown complete.")
+        try:
+            faulthandler.enable(all_threads=True)
+        except Exception as exc:
+            logger.warning("Worker %s: failed to enable faulthandler: %s", rank, exc)
+
+        try:
+            logger.info(
+                "Worker %s: process started with pid=%s, local_rank=%s, num_gpus=%s, "
+                "diffusion_load_format=%s, model=%s",
+                rank,
+                os.getpid(),
+                rank,
+                getattr(od_config, "num_gpus", None),
+                getattr(od_config, "diffusion_load_format", None),
+                getattr(od_config, "model", None),
+            )
+            load_omni_general_plugins()
+            worker_proc = WorkerProc(
+                od_config,
+                gpu_id=rank,
+                broadcast_handle=broadcast_handle,
+                wake_event=wake_event,
+                worker_extension_cls=worker_extension_cls,
+                custom_pipeline_args=custom_pipeline_args,
+            )
+            logger.info(f"Worker {rank}: Scheduler loop started.")
+            pipe_writer.send(
+                {
+                    "status": "ready",
+                    "result_handle": worker_proc.result_mq_handle if rank == 0 else None,
+                }
+            )
+            worker_proc.worker_busy_loop()
+            logger.info(f"Worker {rank}: Shutdown complete.")
+        except BaseException:
+            logger.critical(
+                "Worker %s: fatal error in worker_main; process will exit",
+                rank,
+                exc_info=True,
+            )
+            try:
+                pipe_writer.send({"status": "error", "rank": rank})
+            except Exception:
+                pass
+            try:
+                sys.stderr.flush()
+                sys.stdout.flush()
+            except Exception:
+                pass
+            raise
+        finally:
+            try:
+                pipe_writer.close()
+            except Exception:
+                pass
 
 
 class WorkerWrapperBase:
