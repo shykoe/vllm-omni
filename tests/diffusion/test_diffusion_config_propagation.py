@@ -17,6 +17,7 @@ from vllm_omni.diffusion.data import (
 )
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.model_metadata import (
+    FLUX2_KLEIN_MAX_INPUT_IMAGES,
     HUNYUAN_IMAGE3_MAX_INPUT_IMAGES,
     QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES,
 )
@@ -131,7 +132,7 @@ class TestCreateDefaultDiffusion:
 
     def test_dtype_serialized_as_string(self):
         stages = StageConfigFactory.create_default_diffusion({"dtype": torch.float16, "model": "x"})
-        assert stages[0]["engine_args"]["dtype"] == "torch.float16"
+        assert stages[0]["engine_args"]["dtype"] == "float16"
 
     def test_cache_backend_defaults_to_none(self):
         stages = StageConfigFactory.create_default_diffusion({"model": "x"})
@@ -194,6 +195,18 @@ def test_qwen_image_edit_plus_sets_generic_multimodal_limit():
 
     assert od_config.supports_multimodal_inputs is True
     assert od_config.max_multimodal_image_inputs == QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES
+
+
+def test_flux2_klein_sets_generic_multimodal_limit():
+    od_config = OmniDiffusionConfig(
+        model="black-forest-labs/FLUX.2-klein-9B",
+        model_class_name="Flux2KleinPipeline",
+    )
+
+    od_config.update_multimodal_support()
+
+    assert od_config.supports_multimodal_inputs is True
+    assert od_config.max_multimodal_image_inputs == FLUX2_KLEIN_MAX_INPUT_IMAGES
 
 
 def test_task_type_roundtrip():
