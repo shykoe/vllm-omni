@@ -36,6 +36,7 @@ from vllm_omni.model_executor.models.minimax_h3.reference_video import (
     sample_reference_video_frames,
     serialize_prepared_reference_videos,
 )
+from vllm_omni.model_executor.models.minimax_h3.timeline_guides import GUIDES_EXTRA_KEY
 
 
 def _items(value: Any) -> list[Any]:
@@ -163,6 +164,18 @@ def prepare_text_encoder_prompt(
     video blocks.  Audio is represented only by its H3 text label and is not
     sent to Qwen3-VL.
     """
+    # Reject request-visible incompatibilities before split-stage Qwen work.
+    # Startup cache, fused adapters and resolved attention roles are checked by
+    # the diffusion pipeline, which owns those model instances/configurations.
+    for sampling in sampling_params_list:
+        if not isinstance(sampling, OmniDiffusionSamplingParams) or not (sampling.extra_args or {}).get(
+            GUIDES_EXTRA_KEY
+        ):
+            continue
+        if sampling.quality == "high":
+            raise OmniClientError("MiniMax H3 timeline guides require cache-free execution; use quality=lossless")
+        if sampling.lora_request is not None and float(sampling.lora_scale) != 0.0:
+            raise OmniClientError("MiniMax H3 timeline guides do not support active LoRA/Turbo adapters")
     if isinstance(prompt, str):
         return prompt
     if not isinstance(prompt, dict):

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiniMax-H3 unified offline inference script.
 
 Supports all three MiniMax-H3 tasks and their input combinations:
@@ -28,6 +29,12 @@ Examples:
     # Ref2VA (one or more video references, comma-separated)
     python end2end.py --model /path/to/MiniMax-H3/Ref2VA --task ref2va \
         --video-path subject.mp4,background.mov --prompts "Replace the background."
+
+    # Ordered timeline guides (base H3, dense attention, no cache)
+    python end2end.py --model /path/to/MiniMax-H3/FL2VA --task t2va \
+        --num-frames 124 --fps 24 --seed 42 --quality lossless \
+        --guide 36 image=middle.png --guide -22 video=tail.mp4 audio=tail.flac \
+        --guide 0 audio=ambient.wav --prompts "A quiet cinematic night scene."
 """
 
 import argparse
@@ -35,19 +42,12 @@ import json
 import os
 import time
 
-import numpy as np
-
-from vllm_omni.diffusion.data import DiffusionParallelConfig
-from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
-from vllm_omni.entrypoints.omni import Omni
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-
 MINIMAX_H3_FPS = 24
 MINIMAX_H3_AUDIO_SAMPLE_RATE = 32000
 MINIMAX_H3_ASPECT_RATIOS = ("21:9", "16:9", "4:3", "1:1", "3:4", "9:16")
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="MiniMax-H3 offline inference (t2va / fl2va / ref2va).")
     parser.add_argument(
         "--model",
@@ -86,6 +86,18 @@ def parse_args():
         default=None,
         help="Reference video path(s) for video ref2va. Comma-separated for multiple "
         "videos. The reference soundtracks are used; --audio-path is not accepted.",
+    )
+    parser.add_argument(
+        "--guide",
+        action="append",
+        nargs="+",
+        default=None,
+        metavar="FRAME_OR_SOURCE",
+        help="Repeatable ordered timeline guide: --guide FRAME_INDEX image=PATH|video=PATH|audio=PATH "
+        "[audio=PATH]. Use one visual source at most; audio is explicit (no automatic video soundtrack). "
+        "Quote paths containing spaces. Negative pixel-frame indices count from the aligned output end. "
+        "Local files only; guides do not change task routing or ordinary references. "
+        "Requires base H3, dense attention, and no cache (use --quality lossless).",
     )
 
     # Shape / schedule parameters.
@@ -192,7 +204,7 @@ def parse_args():
         "--cache-config",
         type=str,
         default=None,
-        help='JSON object forwarded to Omni(cache_config=...), e.g. \'{"rel_l1_thresh":0.17}\' for TeaCache.',
+        help="JSON object forwarded to Omni(cache_config=...), e.g. '{\"rel_l1_thresh\":0.17}' for TeaCache.",
     )
     parser.add_argument(
         "--diffusion-attention-backend",
@@ -220,7 +232,45 @@ def parse_args():
             "between start/stop_profile and dumps memory_snapshot-*.pickle into the profiler dir."
         ),
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
+
+
+def _parse_timeline_guides(entries: list[list[str]] | None) -> list[dict]:
+    """Adapt local CLI files to the pipeline's trusted descriptor contract."""
+    if not entries:
+        return []
+
+    from vllm_omni.model_executor.models.minimax_h3.timeline_guides import (
+        TimelineGuideLimits,
+        validate_guide_descriptors,
+    )
+
+    descriptors: list[dict] = []
+    for index, entry in enumerate(entries):
+        if len(entry) < 2:
+            raise ValueError(f"--guide entry {index}: expected FRAME_INDEX and at least one modality=PATH")
+        try:
+            frame_index = int(entry[0])
+        except ValueError as exc:
+            raise ValueError(f"--guide entry {index}: FRAME_INDEX must be an integer") from exc
+        descriptor: dict = {"frame_index": frame_index}
+        for source in entry[1:]:
+            modality, separator, path = source.partition("=")
+            if not separator or modality not in ("image", "video", "audio") or not path:
+                raise ValueError(f"--guide entry {index}: expected image=PATH, video=PATH, or audio=PATH")
+            if modality in descriptor:
+                raise ValueError(f"--guide entry {index}: duplicate {modality} source")
+            descriptor[modality] = os.path.expanduser(path)
+        descriptors.append(descriptor)
+
+    # Validate before making paths absolute so URLs cannot turn into local paths.
+    # Keep negative starts unresolved: the pipeline owns actual output alignment.
+    descriptors = validate_guide_descriptors(descriptors, TimelineGuideLimits())
+    for descriptor in descriptors:
+        for modality in ("image", "video", "audio"):
+            if modality in descriptor:
+                descriptor[modality] = os.path.abspath(descriptor[modality])
+    return descriptors
 
 
 def _split_paths(raw: str | None) -> list[str]:
@@ -301,11 +351,20 @@ def main():
         raise ValueError("MiniMax-H3 TeaCache supports the FL2VA partition only, not ref2va.")
     if args.cache_backend == "tea_cache" and args.quality is not None:
         raise ValueError("--quality configures Cache-DiT and cannot be combined with --cache-backend tea_cache.")
-    os.makedirs(args.output, exist_ok=True)
 
+    guides = _parse_timeline_guides(args.guide)
     task, mm_data = _resolve_task_and_mm_data(args)
     prompts = args.prompts or ["A quiet cinematic night scene with matching ambient sound."]
 
+    import numpy as np
+
+    from vllm_omni.diffusion.data import DiffusionParallelConfig
+    from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
+    from vllm_omni.entrypoints.omni import Omni
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+    from vllm_omni.model_executor.models.minimax_h3.timeline_guides import GUIDES_EXTRA_KEY
+
+    os.makedirs(args.output, exist_ok=True)
     parallel_config = DiffusionParallelConfig(
         ulysses_degree=args.usp,
         ring_degree=args.ring,
@@ -367,12 +426,16 @@ def main():
     print(f"  Cache: backend={args.cache_backend}, config={cache_config}")
     if mm_data:
         print(f"  Conditions: {mm_data}")
+    if guides:
+        print(f"  Timeline guides (ordered): {json.dumps(guides)}")
     print(f"  Prompts: {prompts}")
     print(f"{'=' * 60}\n")
 
     omni = Omni(**omni_kwargs)
 
     extra_args: dict = {"aspect_ratio": args.aspect_ratio}
+    if guides:
+        extra_args[GUIDES_EXTRA_KEY] = guides
     if task is not None:
         extra_args["task"] = task
     if args.duration is not None:

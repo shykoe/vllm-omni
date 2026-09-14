@@ -1751,6 +1751,8 @@ class AsyncDiffusionOutput:
     result: Any | None = None
     output: DiffusionOutput | None = None
     error: str | None = None
+    error_status_code: int | None = None
+    error_type: str | None = None
 
 
 class DiffusionRequestAbortedError(RuntimeError):

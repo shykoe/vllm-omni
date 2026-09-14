@@ -15,7 +15,7 @@ from enum import Enum
 from functools import lru_cache
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, StringConstraints, field_validator, model_validator
 
 from vllm_omni.entrypoints.openai.image_api_utils import parse_size
 from vllm_omni.inputs.data import DIFFUSION_QUALITY_LEVELS
@@ -105,6 +105,27 @@ class UrlAudioReference(BaseModel):
 AudioReference = UrlAudioReference
 
 
+class TimelineGuideUpload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    upload_index: int = Field(strict=True, ge=0, le=_INT64_MAX)
+
+
+class TimelineGuide(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    frame_index: int = Field(strict=True, ge=_INT64_MIN, le=_INT64_MAX)
+    image: TimelineGuideUpload | None = None
+    video: TimelineGuideUpload | None = None
+    audio: TimelineGuideUpload | None = None
+
+    @model_validator(mode="after")
+    def validate_sources(self) -> "TimelineGuide":
+        if self.image is not None and self.video is not None:
+            raise ValueError("A timeline guide cannot contain both image and video")
+        if self.image is None and self.video is None and self.audio is None:
+            raise ValueError("A timeline guide requires at least one source")
+        return self
+
+
 class VideoGenerationRequest(BaseModel):
     """
     OpenAI-style video generation request.
@@ -113,6 +134,17 @@ class VideoGenerationRequest(BaseModel):
     """
 
     # OpenAI standard fields
+    timeline_guides: list[TimelineGuide] | None = None
+    # Only the multipart transport can attach trusted, request-owned paths.
+    _guide_bundle: Any = PrivateAttr(default=None)
+
+    @field_validator("extra_params")
+    @classmethod
+    def reject_internal_guides(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        if value and any(key in value for key in ("_minimax_h3_timeline_guides", "timeline_guides", "guide_files")):
+            raise ValueError("Timeline guides require top-level timeline_guides and guide_files uploads")
+        return value
+
     model: str | None = Field(
         default=None,
         description="Model to use (optional, uses server's configured model if omitted)",
