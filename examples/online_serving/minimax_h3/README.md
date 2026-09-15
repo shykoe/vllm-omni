@@ -17,7 +17,8 @@ wget -P ./input/ \
 ```
 
 Expected SHA-256:
-```
+
+```text
 h3_frame_ref_1.png: d6bcff697b0a1c3fc17692c3644daf150edfe0be5966dcbbc8df817f82c2e48c
 h3_frame_ref_2.png: 259f46eb04e977036a34bfa784c9cfacf4d91a255af1508899f72c62b81c6230
 h3_frame_ref_3.png: 14314a54df5beb54b15f56a1d1c2c592b347087c0df3ac9e4f163ee2374b9dcb
@@ -27,7 +28,7 @@ h3_frame_ref_4.png: 4a853f271b8ff83d4f6f2da5693f23342b90c982860a9e16047f45d49ab9
 ## Files
 
 | Script | Purpose |
-|---|---|
+| --- | --- |
 | `run_server_minimax_h3.sh` | Start the MiniMax H3 Ref2VA server on port 8099 |
 | `run_curl_minimax_h3_guides_async.sh` | GUIDE-01 four-image demo via async `POST /v1/videos` + poll + download |
 | `run_curl_minimax_h3_guides_sync.sh` | Same demo via blocking `POST /v1/videos/sync` (one-shot latency) |
@@ -85,7 +86,7 @@ This is the GUIDE-01 reference case, matching the ComfyUI multi-frame reference
 workflow (`user/default/workflows/minimax_h3_multiframe_reference.json`).
 
 | Upload | Role | Frame |
-|---|---|---|
+| --- | --- | --- |
 | `h3_frame_ref_1.png` | Ordinary `input_references` — enters Qwen as `<Picture 1>` and the VAE reference path | — |
 | `h3_frame_ref_2.png` | `guide_files[0]` — image guide at frame 36 | 36 |
 | `h3_frame_ref_3.png` | `guide_files[1]` — image guide at frame 72 | 72 |
@@ -147,11 +148,12 @@ to `vllm serve` fails with `unrecognized arguments`.
 The two new multipart form fields on `POST /v1/videos` and `POST /v1/videos/sync`:
 
 | Field | Type | Description |
-|---|---|---|
+| --- | --- | --- |
 | `timeline_guides` | JSON string | Ordered manifest. Each entry: `frame_index` (strict int) + at least one of `image`, `video`, `audio`, each `{"upload_index": N}`. `image` and `video` cannot coexist. |
 | `guide_files` | repeated file upload | Binary files in manifest order. Image: JPEG/PNG/WebP. Video: MP4/MOV. Audio: WAV/MP3/FLAC. |
 
 Guides require:
+
 - A guide-capable model (`MiniMaxH3Pipeline` or `MiniMaxH3ModularPipeline`)
 - `quality=lossless` (or no `quality` with a lossless server default)
 - No active LoRA/Turbo adapter
