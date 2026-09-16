@@ -111,6 +111,18 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o output.mp4
 The final content is available from `/v1/videos/{video_id}/content` after the
 job status becomes `completed`.
 
+`queued` means the request is still waiting for diffusion scheduler admission.
+The status changes to `in_progress` when the scheduler first selects the
+request for execution.
+
+`DELETE /v1/videos/{video_id}` issues a bounded engine abort
+(`VLLM_OMNI_ABORT_TIMEOUT`, default 2s), then cancels the frontend
+task. Cancellation cleanup is also bounded and best-effort: it confirms
+the abort was queued, and the current request batch may still drain.
+The job is then re-read so a completed save is not orphaned.
+Guided requests are the exception; see
+[Cancellation and Cleanup](#cancellation-and-cleanup).
+
 ### Synchronous Response
 
 `POST /v1/videos/sync` blocks until generation finishes and returns raw video
@@ -350,9 +362,14 @@ may continue. The server retains all file-backed inputs, including ordinary
 references, and the outstanding-job reservation until the inner task completes
 safely, then discards the result and removes temporary files. Unsubmitted work
 can be cleaned up immediately. DELETE cannot be undone by a late completion or
-output-store write. Graceful shutdown drains submitted guided work before engine
+output-store write. Guided DELETE deliberately skips the bounded engine abort and
+frontend task cancellation used for no-guide jobs: an abort acknowledgment does
+not establish that a worker stopped reading the file-backed guide inputs.
+Graceful shutdown drains submitted guided work before engine
 teardown; this can take as long as generation. No immediate GPU abort or
 cross-host file transfer is provided. No-guide cancellation is unchanged.
+Guided jobs report `queued` until the engine reports inference start, matching
+no-guide jobs.
 
 If an engine failure or unexpected inner-task cancellation prevents confirmation
 that workers finished reading, cleanup is deliberately conservative: inputs and

@@ -27,6 +27,7 @@ from PIL import Image
 from pytest_mock import MockerFixture
 from vllm import envs
 
+from vllm_omni.diffusion.data import DIFFUSION_REQUEST_LIFECYCLE_KEY, DIFFUSION_REQUEST_STARTED
 from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
 from vllm_omni.entrypoints.openai import api_server, video_api_utils
 from vllm_omni.entrypoints.openai.api_server import router
@@ -55,6 +56,22 @@ _requires_guided_runtime = pytest.mark.skipif(
 )
 
 
+def _delete_request_stub(handler=None):
+    """Minimal ``Request`` stand-in for direct ``delete_video`` calls.
+
+    ``delete_video`` resolves the video handler from ``app.state`` to issue the
+    bounded engine abort. Guided jobs return before that lookup, so the stub only
+    needs to expose the attribute chain.
+    """
+    if handler is None:
+        handler = SimpleNamespace(abort_request=_noop_abort_request)
+    return SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(openai_serving_video=handler)))
+
+
+async def _noop_abort_request(request_id):
+    del request_id
+
+
 class MockVideoResult:
     def __init__(
         self,
@@ -64,6 +81,7 @@ class MockVideoResult:
         multimodal_output=None,
         stage_durations=None,
         peak_memory_mb=0.0,
+        custom_output=None,
     ):
         self.multimodal_output = dict(multimodal_output or {"video": videos})
         if audios is not None:
@@ -72,6 +90,7 @@ class MockVideoResult:
             self.multimodal_output["audio_sample_rate"] = sample_rate
         self.stage_durations = stage_durations or {}
         self.peak_memory_mb = peak_memory_mb
+        self.custom_output = custom_output or {}
 
 
 class FakeAsyncOmni:
@@ -112,8 +131,16 @@ class FakeAsyncOmni:
         ):
             self.captured_reference_video_bytes = [Path(item).read_bytes() for item in reference_videos]
         num_outputs = sampling_params_list[0].num_outputs_per_prompt
+        if sampling_params_list[0].emit_request_lifecycle:
+            yield MockVideoResult(
+                [],
+                custom_output={DIFFUSION_REQUEST_LIFECYCLE_KEY: DIFFUSION_REQUEST_STARTED},
+            )
         videos = [object() for _ in range(num_outputs)]
         yield MockVideoResult(videos)
+
+    async def abort(self, request_id, *, timeout=None):
+        del request_id, timeout
 
 
 def test_raw_and_base64_encoders_receive_persistent_converter(mocker: MockerFixture):
@@ -234,15 +261,122 @@ class BlockingVideoHandler:
             self.stage_configs = stage_configs
 
     async def generate_video_bytes(
-        self, request, reference_id, *, reference_image=None, reference_video=None, reference_audio=None
+        self,
+        request,
+        reference_id,
+        *,
+        reference_image=None,
+        reference_video=None,
+        reference_audio=None,
+        on_started=None,
     ):
         del request, reference_id, reference_image, reference_video, reference_audio
+        if on_started is not None:
+            await on_started()
         self.started.set()
         try:
             await asyncio.Future()
         except asyncio.CancelledError:
             self.cancelled.set()
             raise
+
+    async def abort_request(self, request_id):
+        del request_id
+
+
+class HangingAbortHandler(BlockingVideoHandler):
+    """Engine abort never returns; DELETE must time out and still cancel."""
+
+    async def abort_request(self, request_id):
+        del request_id
+        await asyncio.sleep(30)
+
+
+class CompletingDuringAbortHandler(BlockingVideoHandler):
+    """Finishes and persists output while DELETE is still awaiting abort."""
+
+    def __init__(self):
+        super().__init__()
+        self._finish = asyncio.Event()
+
+    async def generate_video_bytes(
+        self,
+        request,
+        reference_id,
+        *,
+        reference_image=None,
+        reference_video=None,
+        reference_audio=None,
+        on_started=None,
+    ):
+        del request, reference_image, reference_video, reference_audio
+        if on_started is not None:
+            await on_started()
+        self.started.set()
+        await self._finish.wait()
+        return b"late-complete", {}, 0.0, None
+
+    async def abort_request(self, request_id):
+        self._finish.set()
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            job = await api_server.VIDEO_STORE.get(request_id)
+            if job is not None and job.status is VideoGenerationStatus.COMPLETED and job.file_name is not None:
+                return
+            await asyncio.sleep(0.01)
+        raise RuntimeError(f"video job {request_id} did not complete during abort")
+
+
+class SchedulerQueuedVideoHandler(BlockingVideoHandler):
+    """Parks after engine submission but before scheduler admission."""
+
+    def __init__(self):
+        super().__init__()
+        self.admit = threading.Event()
+        self.in_progress = threading.Event()
+
+    async def generate_video_bytes(
+        self,
+        request,
+        reference_id,
+        *,
+        reference_image=None,
+        reference_video=None,
+        reference_audio=None,
+        on_started=None,
+    ):
+        del request, reference_id, reference_image, reference_video, reference_audio
+        self.started.set()
+        try:
+            while not self.admit.is_set():
+                await asyncio.sleep(0.01)
+            if on_started is not None:
+                await on_started()
+            self.in_progress.set()
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+
+
+class AbortTrackingOmni(FakeAsyncOmni):
+    def __init__(self):
+        super().__init__()
+        self.aborted: list[str] = []
+        self.entered = threading.Event()
+
+    async def generate(self, prompt, request_id, sampling_params_list, **kwargs):
+        del prompt, request_id, sampling_params_list, kwargs
+        self.entered.set()
+        yield MockVideoResult(
+            [],
+            custom_output={DIFFUSION_REQUEST_LIFECYCLE_KEY: DIFFUSION_REQUEST_STARTED},
+        )
+        await asyncio.Future()
+
+    async def abort(self, request_id, *, timeout=None):
+        assert timeout is not None
+        self.aborted.append(request_id)
 
 
 class FakeServerSocket:
@@ -836,7 +970,7 @@ async def test_guided_delete_during_storage_save(
         task.cancel()
         await asyncio.sleep(0)
         assert not task.done()
-    deleting = asyncio.create_task(api_server.delete_video(job.id))
+    deleting = asyncio.create_task(api_server.delete_video(job.id, _delete_request_stub()))
     await asyncio.sleep(0)
     assert bundle.abandoned
     if cancel_delete:
@@ -892,7 +1026,9 @@ async def test_cancelled_guided_delete_behind_threaded_save_removes_job_and_arti
         delete_waiting.set()
         await original_delete(video_id, owner_bundle)
 
-    async def generate(*args, **kwargs):
+    async def generate(*args, on_started=None, **kwargs):
+        # Guided jobs stay QUEUED until the engine reports inference start.
+        await on_started()
         return b"video", {}, 0.0, None
 
     monkeypatch.setattr(storage, "_save_sync", save)
@@ -907,7 +1043,7 @@ async def test_cancelled_guided_delete_behind_threaded_save_removes_job_and_arti
     deleting = None
     try:
         await asyncio.wait_for(saving.wait(), 2)
-        deleting = asyncio.create_task(api_server.delete_video(job.id))
+        deleting = asyncio.create_task(api_server.delete_video(job.id, _delete_request_stub()))
         await asyncio.wait_for(delete_waiting.wait(), 2)
         assert bundle.lock.locked()
         assert (await store.get(job.id)).status == VideoGenerationStatus.IN_PROGRESS
@@ -1124,7 +1260,7 @@ async def test_guided_delete_before_generation_starts(tmp_path, isolated_video_b
             job.id,
         )
     )
-    response = await api_server.delete_video(job.id)
+    response = await api_server.delete_video(job.id, _delete_request_stub())
     await task
     assert response.deleted
     assert await store.get(job.id) is None
@@ -1174,6 +1310,138 @@ async def test_guided_engine_boundary_requires_normal_output_completion(tmp_path
         assert path.exists() and bundle in handler.guided_requests.bundles
         bundle.close()  # This test independently knows that its engine double has no readers.
     handler.shutdown()
+
+
+@pytest.mark.asyncio
+@_requires_guided_runtime
+async def test_guided_generation_reports_started_and_engine_boundaries(tmp_path, monkeypatch):
+    """Guided requests keep both lifecycle signals: admission and inference start.
+
+    ``on_engine_admitted`` guards input ownership while ``on_started`` drives the
+    QUEUED -> IN_PROGRESS transition. The started sentinel must not be mistaken
+    for a generation result.
+    """
+    from vllm_omni.diffusion.data import DIFFUSION_REQUEST_LIFECYCLE_KEY, DIFFUSION_REQUEST_STARTED
+
+    engine = FakeAsyncOmni()
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="test")
+    bundle = handler.guided_requests.reserve(1)
+    path = tmp_path / "guide"
+    path.write_bytes(b"input")
+    bundle.paths.add(str(path))
+    final = MockVideoResult([object()])
+    lifecycle_enabled = []
+
+    async def generate(**kwargs):
+        kwargs["on_engine_admitted"]()
+        lifecycle_enabled.append(kwargs["sampling_params_list"][0].emit_request_lifecycle)
+        yield MockVideoResult([], custom_output={DIFFUSION_REQUEST_LIFECYCLE_KEY: DIFFUSION_REQUEST_STARTED})
+        yield final
+
+    started = []
+
+    async def on_started() -> None:
+        started.append(bundle.engine_started)
+
+    monkeypatch.setattr(engine, "generate", generate)
+    result = await bundle.submit(
+        handler._run_generation(
+            {"prompt": "test"},
+            OmniDiffusionSamplingParams(),
+            "guided-started",
+            on_started=on_started,
+            guide_bundle=bundle,
+        )
+    )
+    assert result is final
+    assert lifecycle_enabled == [True]
+    assert started == [True]
+    assert bundle.engine_started and bundle.engine_completed
+    await handler.drain_guided_requests()
+    assert not path.exists() and not handler.guided_requests.bundles
+    handler.shutdown()
+
+
+@pytest.mark.asyncio
+@_requires_guided_runtime
+async def test_guided_job_stays_queued_until_engine_reports_start(isolated_video_backends):
+    """A guided async job must not report IN_PROGRESS before inference starts."""
+    from vllm_omni.entrypoints.openai.video.generation.guided_lifetime import GuidedRequestLifetime
+
+    store, _, _storage = isolated_video_backends
+    owner = GuidedRequestLifetime()
+    bundle = owner.reserve(1)
+    job = VideoResponse(id="guided-queued-until-start", model="test", prompt="test")
+    await store.upsert(job.id, job)
+    bundle.job_id = job.id
+    GUIDED_JOBS[job.id] = bundle
+    request = VideoGenerationRequest(prompt="test")
+    request._guide_bundle = bundle
+    inferring = asyncio.Event()
+    release = asyncio.Event()
+
+    async def generate(*args, on_started=None, **kwargs):
+        assert (await store.get(job.id)).status == VideoGenerationStatus.QUEUED
+        await on_started()
+        inferring.set()
+        await release.wait()
+        return b"video", {}, 0.0, None
+
+    task = bundle.submit(
+        video_generation_helpers._run_video_generation_job(
+            SimpleNamespace(generate_video_bytes=generate),
+            request,
+            job.id,
+        )
+    )
+    await asyncio.wait_for(inferring.wait(), 2)
+    assert (await store.get(job.id)).status == VideoGenerationStatus.IN_PROGRESS
+    release.set()
+    await task
+    assert (await store.get(job.id)).status == VideoGenerationStatus.COMPLETED
+    assert not owner.bundles
+
+
+@pytest.mark.asyncio
+@_requires_guided_runtime
+async def test_guided_started_notification_after_delete_keeps_job_removed(tmp_path, isolated_video_backends):
+    """DELETE pops the store entry; a later start notification must not revive it."""
+    from vllm_omni.entrypoints.openai.video.generation.guided_lifetime import GuidedRequestLifetime
+
+    store, _, _storage = isolated_video_backends
+    owner = GuidedRequestLifetime()
+    bundle = owner.reserve(1)
+    path = tmp_path / "guide"
+    path.write_bytes(b"input")
+    bundle.paths.add(str(path))
+    job = VideoResponse(id="guided-start-after-delete", model="test", prompt="test")
+    await store.upsert(job.id, job)
+    bundle.job_id = job.id
+    GUIDED_JOBS[job.id] = bundle
+    request = VideoGenerationRequest(prompt="test")
+    request._guide_bundle = bundle
+    entered = asyncio.Event()
+    deleted = asyncio.Event()
+
+    async def generate(*args, on_started=None, **kwargs):
+        entered.set()
+        await deleted.wait()
+        await on_started()
+        return b"video", {}, 0.0, None
+
+    task = bundle.submit(
+        video_generation_helpers._run_video_generation_job(
+            SimpleNamespace(generate_video_bytes=generate),
+            request,
+            job.id,
+        )
+    )
+    await asyncio.wait_for(entered.wait(), 2)
+    assert (await api_server.delete_video(job.id, _delete_request_stub())).deleted
+    deleted.set()
+    await task
+    assert await store.get(job.id) is None
+    assert not path.exists() and not owner.bundles
 
 
 @pytest.mark.asyncio
@@ -1446,12 +1714,12 @@ def test_i2v_video_generation_resizes_input_to_requested_dimensions(test_client,
 
 def test_i2v_resize_policy_can_defer_to_pipeline(monkeypatch):
     engine = FakeAsyncOmni()
-    engine.get_diffusion_od_config = lambda: SimpleNamespace(
+    engine.get_diffusion_od_config = lambda: SimpleNamespace(  # type: ignore[method-assign]
         model="org/model",
         model_class_name="ExamplePipeline",
         revision="pinned-revision",
     )
-    captured = {}
+    captured: dict[str, str | None] = {}
 
     def fake_policy(model_class_name, *, model, revision=None):
         captured.update(
@@ -1479,6 +1747,7 @@ def test_i2v_resize_policy_can_defer_to_pipeline(monkeypatch):
         )
     )
 
+    assert engine.captured_prompt is not None
     input_image = engine.captured_prompt["multi_modal_data"]["image"]
     assert isinstance(input_image, Image.Image)
     assert input_image.size == (48, 32)
@@ -1572,6 +1841,7 @@ def test_video_generation_bridges_request_fields(generation_request, expected_nu
 
     asyncio.run(handler._run_and_extract(generation_request, "field-bridge"))
 
+    assert engine.captured_sampling_params_list is not None
     sampling = engine.captured_sampling_params_list[0]
     # Top-level ``seconds`` bridges into extra_args["duration"]; num_frames is
     # passed through (or derived as seconds x fps when omitted). No private
@@ -2357,7 +2627,7 @@ def test_video_generation_response_exposes_action_payload(mocker: MockerFixture)
             },
         )
 
-    engine.generate = _generate
+    engine.generate = _generate  # type: ignore[method-assign]
     mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
         return_value="encoded-video",
@@ -2948,6 +3218,80 @@ def test_delete_in_progress_job_cancels_task_and_removes_metadata(test_client):
 
     retrieve_resp = test_client.get(f"/v1/videos/{video_id}")
     assert retrieve_resp.status_code == 404
+
+
+def test_async_video_stays_queued_until_scheduler_admission(test_client):
+    handler = SchedulerQueuedVideoHandler()
+    test_client.app.state.openai_serving_video = handler
+
+    create_resp = test_client.post("/v1/videos", data={"prompt": "Queue this video"})
+    assert create_resp.status_code == 200
+    video_id = create_resp.json()["id"]
+    assert handler.started.wait(timeout=2.0)
+
+    queued = test_client.get(f"/v1/videos/{video_id}")
+    assert queued.status_code == 200
+    assert queued.json()["status"] == VideoGenerationStatus.QUEUED.value
+
+    handler.admit.set()
+    assert handler.in_progress.wait(timeout=2.0)
+    in_progress = test_client.get(f"/v1/videos/{video_id}")
+    assert in_progress.status_code == 200
+    assert in_progress.json()["status"] == VideoGenerationStatus.IN_PROGRESS.value
+
+    assert test_client.delete(f"/v1/videos/{video_id}").status_code == 200
+
+
+def test_delete_times_out_engine_abort_and_still_cancels(test_client, monkeypatch):
+    monkeypatch.setattr(api_server, "VIDEO_ABORT_TIMEOUT_S", 0.05)
+    handler = HangingAbortHandler()
+    test_client.app.state.openai_serving_video = handler
+
+    create_resp = test_client.post("/v1/videos", data={"prompt": "Hang abort"})
+    assert create_resp.status_code == 200
+    video_id = create_resp.json()["id"]
+    assert handler.started.wait(timeout=2.0)
+
+    started = time.monotonic()
+    delete_resp = test_client.delete(f"/v1/videos/{video_id}")
+    assert time.monotonic() - started < 2.0
+    assert delete_resp.status_code == 200
+    assert handler.cancelled.wait(timeout=2.0)
+
+
+def test_delete_removes_artifact_if_job_completes_during_abort(test_client):
+    handler = CompletingDuringAbortHandler()
+    test_client.app.state.openai_serving_video = handler
+
+    create_resp = test_client.post("/v1/videos", data={"prompt": "Complete during delete"})
+    assert create_resp.status_code == 200
+    video_id = create_resp.json()["id"]
+    assert handler.started.wait(timeout=2.0)
+
+    assert test_client.delete(f"/v1/videos/{video_id}").status_code == 200
+    file_path = os.path.join(api_server.STORAGE_MANAGER.storage_path, video_id)
+    assert not os.path.exists(file_path)
+    assert asyncio.run(api_server.VIDEO_STORE.get(video_id)) is None
+
+
+def test_delete_aborts_engine_request_before_cancelling_task(test_client):
+    engine = AbortTrackingOmni()
+    test_client.app.state.openai_serving_video = OmniOpenAIServingVideo.for_diffusion(
+        engine,
+        model_name="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+    )
+
+    create_resp = test_client.post("/v1/videos", data={"prompt": "Abort this video"})
+    assert create_resp.status_code == 200
+    video_id = create_resp.json()["id"]
+    assert engine.entered.wait(timeout=2.0)
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.IN_PROGRESS.value)
+
+    delete_resp = test_client.delete(f"/v1/videos/{video_id}")
+    assert delete_resp.status_code == 200
+    assert delete_resp.json()["deleted"] is True
+    _wait_until(lambda: engine.aborted == [video_id])
+    assert asyncio.run(api_server.VIDEO_STORE.get(video_id)) is None
 
 
 def test_video_response_file_extension_is_robust():

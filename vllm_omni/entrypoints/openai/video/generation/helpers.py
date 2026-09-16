@@ -337,9 +337,12 @@ async def _run_video_generation_job(
         _cleanup_video_references(reference_video, reference_audio, control_path)
         return
 
-    await VIDEO_STORE.update_fields(video_id, {"status": VideoGenerationStatus.IN_PROGRESS})
     started_at = time.perf_counter()
     try:
+
+        async def _mark_started() -> None:
+            await VIDEO_STORE.update_fields(video_id, {"status": VideoGenerationStatus.IN_PROGRESS})
+
         video_bytes, stage_durations, peak_memory_mb, action, video_metadata = _unpack_video_generation_result(
             await handler.generate_video_bytes(
                 request,
@@ -347,6 +350,7 @@ async def _run_video_generation_job(
                 reference_image=reference_image,
                 reference_video=reference_video,
                 reference_audio=reference_audio,
+                on_started=_mark_started,
             )
         )
 
@@ -425,13 +429,23 @@ async def _run_guided_video_generation_job(
             job = await VIDEO_STORE.get(video_id)
             if bundle.abandoned or job is None:
                 return
-            await VIDEO_STORE.update_fields(video_id, {"status": VideoGenerationStatus.IN_PROGRESS})
+
+        # Guided jobs stay QUEUED until the engine reports inference start, so
+        # the reported status matches the unguided path. Abandonment is checked
+        # under the bundle lock because DELETE pops the store entry there.
+        async def _mark_started() -> None:
+            async with bundle.lock:
+                if bundle.abandoned:
+                    return
+                await VIDEO_STORE.update_fields(video_id, {"status": VideoGenerationStatus.IN_PROGRESS})
+
         result = await handler.generate_video_bytes(
             request,
             video_id,
             reference_image=reference_image,
             reference_video=reference_video,
             reference_audio=reference_audio,
+            on_started=_mark_started,
         )
         if asyncio.current_task().cancelling():
             bundle.abandoned = True

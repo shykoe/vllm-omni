@@ -7,7 +7,7 @@ import asyncio
 import copy
 import math
 import time
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from functools import cached_property
 from http import HTTPStatus
@@ -20,9 +20,10 @@ from PIL import Image
 from vllm.engine.protocol import EngineClient
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.data import is_diffusion_request_started_output
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.utils.media_utils import count_mp4_frames, normalize_preencode_batch_frames
-from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.async_omni import ABORT_TIMEOUT_S, AsyncOmni
 from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoAction,
     VideoData,
@@ -276,6 +277,9 @@ class OmniOpenAIServingVideo:
     def shutdown(self) -> None:
         self._video_frame_converter.shutdown()
 
+    async def abort_request(self, request_id: str) -> None:
+        await self._engine_client.abort(request_id, timeout=ABORT_TIMEOUT_S)
+
     async def drain_guided_requests(self) -> None:
         await self.guided_requests.drain()
 
@@ -298,6 +302,7 @@ class OmniOpenAIServingVideo:
         reference_image: ReferenceImage | None = None,
         reference_video: ReferenceVideo | None = None,
         reference_audio: ReferenceAudio | None = None,
+        on_started: Callable[[], Awaitable[None]] | None = None,
     ) -> VideoGenerationArtifacts:
         """Run the generation pipeline and extract video/audio/profiler outputs."""
         if request.extra_params and any(
@@ -493,6 +498,7 @@ class OmniOpenAIServingVideo:
             prompt,
             gen_params,
             reference_id,
+            on_started=on_started,
             **({"guide_bundle": request._guide_bundle} if request._guide_bundle is not None else {}),
         )
         multimodal_output = self._extract_multimodal_output(result)
@@ -578,6 +584,7 @@ class OmniOpenAIServingVideo:
         reference_image: ReferenceImage | None = None,
         reference_video: ReferenceVideo | None = None,
         reference_audio: ReferenceAudio | None = None,
+        on_started: Callable[[], Awaitable[None]] | None = None,
     ) -> tuple[bytes, dict[str, float], float, VideoAction | None, dict[str, object]]:
         """Generate a video and return raw MP4 bytes, bypassing base64 encoding."""
         artifacts = await self._run_and_extract(
@@ -586,6 +593,7 @@ class OmniOpenAIServingVideo:
             reference_image=reference_image,
             reference_video=reference_video,
             reference_audio=reference_audio,
+            on_started=on_started,
         )
         if len(artifacts.videos) > 1:
             logger.warning(
@@ -692,6 +700,7 @@ class OmniOpenAIServingVideo:
         gen_params: OmniDiffusionSamplingParams,
         request_id: str,
         *,
+        on_started: Callable[[], Awaitable[None]] | None = None,
         guide_bundle: GuidedRequestBundle | None = None,
     ) -> object:
         stage_configs = self._stage_configs or getattr(self._engine_client, "stage_configs", None)
@@ -712,6 +721,7 @@ class OmniOpenAIServingVideo:
 
         # Common generation logic for both paths
         engine_client = cast(AsyncOmni, self._engine_client)
+        gen_params.emit_request_lifecycle = on_started is not None
         sampling_params_list = build_stage_sampling_params_list(
             list(stage_configs),
             get_default_sampling_params_list(engine_client),
@@ -720,6 +730,7 @@ class OmniOpenAIServingVideo:
         )
 
         result = None
+        started_notified = False
         generate_kwargs: dict[str, Any] = {}
         if guide_bundle is not None:
             bundle = guide_bundle
@@ -740,6 +751,11 @@ class OmniOpenAIServingVideo:
                 sampling_params_list=sampling_params_list,
                 **generate_kwargs,
             ):
+                if is_diffusion_request_started_output(output):
+                    if on_started is not None and not started_notified:
+                        await on_started()
+                        started_notified = True
+                    continue
                 result = output
         except OmniClientError as exc:
             # Only origin-qualified terminal worker rejections prove completion.
