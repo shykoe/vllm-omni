@@ -500,7 +500,7 @@ sequenceDiagram
     Note over Bundle: set abandoned, keep inputs and capacity
     Engine-->>Task: actual terminal completion
     Task->>Bundle: check abandonment under publication lock
-    Note over Task,Store: discard output; do not recreate deleted job
+    Note over Task,Store: discard output, do not recreate deleted job
     Task-->>Bundle: completion callback
     Bundle->>Bundle: remove sources and release reservation
 ```
