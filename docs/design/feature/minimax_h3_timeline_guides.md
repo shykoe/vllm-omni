@@ -405,11 +405,19 @@ benchmarks.
 
 ### Shared preparation boundaries
 
-`_prepare_request_inputs()` resolves ordinary routing, shape, effective profile,
-limits and conditioning. `_build_denoise_inputs()` performs final row/shape
-checks and constructs the packed denoising tensors. `guide_blocks` is carried
-through the context and `_MINIMAX_H3_DENOISE_INPUT_KEYS` so both request and step
-execution use the same logic rather than separate guide implementations.
+`_prepare_encoder_conditioning_inputs()` resolves ordinary routing, effective
+profile, limits and guide conditioning on top of the encoder-stage
+`MiniMaxH3EncoderConditioning` (canvas, frame count, ordinary reference anchors),
+whether that conditioning was produced locally or by a separate encoder stage.
+`_build_denoise_inputs()` performs final row/shape checks and constructs the
+packed denoising tensors. `guide_blocks` is carried through the context and
+`_MINIMAX_H3_DENOISE_INPUT_KEYS` so both request and step execution use the same
+logic rather than separate guide implementations.
+
+Guide codecs run in the diffusion stage, so a guided request requires a local
+VAE encoder there. A deployment that moves the VAE encoders into the encoder
+stage (`vae_encoder=false` on the diffusion stage) rejects guides with a 400
+instead of failing inside a decode-only VAE.
 
 Guide normalization/encoding belongs in `_encode_timeline_guides()`. Stills use
 `encode_image`; clips use `encode_video`. The latter requires a contiguous uint8

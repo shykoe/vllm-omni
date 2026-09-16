@@ -110,6 +110,8 @@ def _step_pipeline(model, *, packed_batch_supported: bool = True):
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
+    pipeline.load_text_encoder = False
+    pipeline.load_vae_encoder = False
     pipeline.transformer = model
     pipeline.device = torch.device("cpu")
     pipeline._transformer_for_task = lambda task: model
@@ -438,8 +440,17 @@ def test_prepare_encode_seeds_runner_visible_state(monkeypatch, batch_frames):
     }
 
     pipeline = _step_pipeline(_SegmentMeanModel())
-    monkeypatch.setattr(mod.MiniMaxH3Pipeline, "_extract_prompt", staticmethod(lambda _: ("a prompt", {})))
-    monkeypatch.setattr(mod.MiniMaxH3Pipeline, "_prepare_request_inputs", lambda self, **_: context)
+    conditioning = object()
+    monkeypatch.setattr(
+        mod.MiniMaxH3Pipeline,
+        "_extract_encoder_conditioning",
+        staticmethod(lambda _: conditioning),
+    )
+    monkeypatch.setattr(
+        mod.MiniMaxH3Pipeline,
+        "_prepare_encoder_conditioning_inputs",
+        lambda self, value, sampling: context,
+    )
     monkeypatch.setattr(
         mod.MiniMaxH3Pipeline,
         "_build_denoise_inputs",
