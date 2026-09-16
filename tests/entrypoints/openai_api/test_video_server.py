@@ -15,6 +15,7 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import av
 import httpx
@@ -92,9 +93,13 @@ class FakeAsyncOmni:
     def get_diffusion_od_config(self):
         return SimpleNamespace(model_class_name=self.model_class_name)
 
-    async def generate(self, prompt, request_id, sampling_params_list):
+    async def generate(self, prompt, request_id, sampling_params_list, **kwargs):
         self.captured_prompt = prompt
         self.captured_sampling_params_list = sampling_params_list
+        # ``_run_generation`` passes ``on_engine_admitted`` for guided requests.
+        on_engine_admitted = kwargs.get("on_engine_admitted")
+        if on_engine_admitted is not None:
+            on_engine_admitted()
         for control_type in ("edge", "blur", "depth", "seg", "wsm"):
             control_params = sampling_params_list[0].extra_args.get(control_type)
             if isinstance(control_params, dict) and isinstance(control_params.get("control_path"), str):
@@ -467,7 +472,7 @@ def test_timeline_guide_clip_flac_and_av_transport(test_client, mocker, monkeypa
     paths = []
     captured = {}
 
-    async def generate(prompt, request_id, sampling_params_list):
+    async def generate(prompt, request_id, sampling_params_list, on_engine_admitted=None):
         descriptors = sampling_params_list[0].extra_args["_minimax_h3_timeline_guides"]
         assert len(descriptors) == 1
         assert descriptors[0]["frame_index"] == 36
@@ -478,6 +483,7 @@ def test_timeline_guide_clip_flac_and_av_transport(test_client, mocker, monkeypa
             captured[kind] = path.read_bytes()
             assert path.suffix == Path(uploads[kind][0]).suffix
         assert not prompt.get("multi_modal_data")
+        on_engine_admitted()
         yield MockVideoResult([object()])
 
     monkeypatch.setattr(engine, "generate", generate)
@@ -611,11 +617,12 @@ def test_terminal_guide_validation_errors_do_not_exhaust_capacity(test_client, m
     engine.model_class_name = "MiniMaxH3Pipeline"
     paths = []
 
-    async def generate(prompt, request_id, sampling_params_list):
+    async def generate(prompt, request_id, sampling_params_list, on_engine_admitted=None):
         guide = sampling_params_list[0].extra_args["_minimax_h3_timeline_guides"][0]
         assert guide["frame_index"] == 100000
         paths.append(Path(guide["image"]))
         assert paths[-1].exists()
+        on_engine_admitted()
         error = OmniClientError("timeline guide frame_index 100000 is outside the output")
         error.worker_finished = True  # Simulate an origin-qualified terminal worker rejection.
         raise error
@@ -635,6 +642,47 @@ def test_terminal_guide_validation_errors_do_not_exhaust_capacity(test_client, m
         else:
             assert response.status_code == 400
             assert "100000" in response.json()["detail"]
+        _wait_until(lambda: not handler.guided_requests.bundles)
+        assert not any(path.exists() for path in paths)
+    assert len(paths) == 6
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+@_requires_guided_runtime
+def test_pre_dispatch_generate_failures_do_not_exhaust_capacity(test_client, monkeypatch, endpoint):
+    """Failures before EngineCore accepts must release uploads and capacity.
+
+    ``AsyncOmni.generate()`` rejects an asleep engine, a diffusion list prompt
+    and bad sampling params after the generator is entered but before
+    ``add_request_async``. Nothing is queued in any worker then, so retaining
+    the uploads would leak the files *and* an admission slot on every attempt.
+    """
+    handler = test_client.app.state.openai_serving_video
+    engine = handler._engine_client
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    paths = []
+
+    async def generate(prompt, request_id, sampling_params_list, on_engine_admitted=None):
+        guide = sampling_params_list[0].extra_args["_minimax_h3_timeline_guides"][0]
+        paths.append(Path(guide["image"]))
+        assert paths[-1].exists()
+        # Never acknowledge admission: this models the pre-submission rejects.
+        raise RuntimeError("Generation rejected: Engine is partially or fully asleep.")
+        yield  # Make the engine double an async iterator; serving methods remain real.
+
+    monkeypatch.setattr(engine, "generate", generate)
+    for _ in range(6):  # Exceeds the default four outstanding guided requests.
+        response = test_client.post(
+            endpoint,
+            data={"prompt": "test", "timeline_guides": '[{"frame_index": 0, "image": {"upload_index": 0}}]'},
+            files={"guide_files": ("guide.png", _make_test_image_bytes(), "image/png")},
+        )
+        if endpoint == "/v1/videos":
+            assert response.status_code == 200
+            failed = _wait_for_status(test_client, response.json()["id"], "failed")
+            assert failed["error"]["code"] == 500
+        else:
+            assert response.status_code == 500
         _wait_until(lambda: not handler.guided_requests.bundles)
         assert not any(path.exists() for path in paths)
     assert len(paths) == 6
@@ -976,7 +1024,63 @@ def test_guided_partial_upload_failure_releases_files(test_client, monkeypatch, 
         ],
     )
     assert response.status_code == 400
-    assert paths and not any(Path(path).exists() for path in paths)
+    assert not handler.guided_requests.bundles
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+@_requires_guided_runtime
+def test_out_of_process_diffusion_stage_limits_reach_the_http_boundary(test_client, monkeypatch, endpoint):
+    """Split deployments must not silently fall back to default guide limits.
+
+    An out-of-process diffusion stage keeps its ``OmniDiffusionConfig`` in the
+    worker, so the API process only sees the sanitized ``model_config``
+    snapshot the stage client carries. This exercises the real resolution
+    chain: stage client -> ``AsyncOmniEngine`` view -> ``AsyncOmni`` ->
+    ``timeline_guide_limits()``.
+    """
+    from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+    from vllm_omni.entrypoints.async_omni import AsyncOmni
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.data.resolve_model_class_name",
+        lambda model: "MiniMaxH3Pipeline",
+    )
+    handler = test_client.app.state.openai_serving_video
+    inner = object.__new__(AsyncOmniEngine)
+    inner.model = "MiniMaxAI/MiniMax-H3"
+    inner._diffusion_od_config_view = None
+    inner.stage_clients = [
+        SimpleNamespace(
+            stage_type="diffusion",
+            diffusion_model_config={"minimax_h3_timeline_guides": {"max_entries": 1, "max_outstanding_requests": 1}},
+        )
+    ]
+    omni = object.__new__(AsyncOmni)
+    omni.engine = inner
+    monkeypatch.setattr(handler._engine_client, "get_diffusion_od_config", omni.get_diffusion_od_config)
+
+    limits = handler.timeline_guide_limits()
+    assert limits.max_entries == 1
+    assert limits.max_outstanding_requests == 1
+
+    generate = Mock(side_effect=AssertionError("over-limit guided request must never reach the engine"))
+    monkeypatch.setattr(handler._engine_client, "generate", generate)
+    response = test_client.post(
+        endpoint,
+        data={
+            "prompt": "test",
+            "timeline_guides": (
+                '[{"frame_index": 0, "image": {"upload_index": 0}}, {"frame_index": 24, "image": {"upload_index": 1}}]'
+            ),
+        },
+        files=[
+            ("guide_files", ("first.png", _make_test_image_bytes(), "image/png")),
+            ("guide_files", ("second.png", _make_test_image_bytes(), "image/png")),
+        ],
+    )
+    assert response.status_code == 400
+    generate.assert_not_called()
+    # Rejected before any bundle reserved a slot, so no upload was persisted.
     assert not handler.guided_requests.bundles
 
 
@@ -1041,6 +1145,9 @@ async def test_guided_engine_boundary_requires_normal_output_completion(tmp_path
     bundle.paths.add(str(path))
 
     async def generate(**kwargs):
+        # A submitted request is the only thing that makes ``engine_started``
+        # true; production sets it from this callback, never on entry.
+        kwargs["on_engine_admitted"]()
         if outcome == "engine_error":
             raise RuntimeError("engine transport failed")
         if outcome != "empty":
@@ -1066,6 +1173,45 @@ async def test_guided_engine_boundary_requires_normal_output_completion(tmp_path
     else:
         assert path.exists() and bundle in handler.guided_requests.bundles
         bundle.close()  # This test independently knows that its engine double has no readers.
+    handler.shutdown()
+
+
+@pytest.mark.asyncio
+@_requires_guided_runtime
+async def test_guided_failure_before_engine_admission_releases_inputs(tmp_path, monkeypatch):
+    """A failure before EngineCore accepts must release uploads and capacity.
+
+    ``generate()`` can reject a request after the coroutine is entered but
+    before ``add_request_async`` (asleep engine, diffusion list-prompt
+    rejection, sampling resolution). Nothing is queued in the worker then, so
+    retaining the uploads would leak both the files and an admission slot.
+    """
+    engine = FakeAsyncOmni()
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="test")
+    bundle = handler.guided_requests.reserve(1)
+    path = tmp_path / "guide"
+    path.write_bytes(b"input")
+    bundle.paths.add(str(path))
+
+    async def generate(**kwargs):
+        raise RuntimeError("Generation rejected: Engine is partially or fully asleep.")
+        yield  # Make the double an async iterator without ever admitting.
+
+    monkeypatch.setattr(engine, "generate", generate)
+    task = bundle.submit(
+        handler._run_generation(
+            {"prompt": "test"},
+            OmniDiffusionSamplingParams(),
+            "guided-pre-dispatch",
+            guide_bundle=bundle,
+        )
+    )
+    await asyncio.gather(task, return_exceptions=True)
+    assert not bundle.engine_started
+    assert not bundle.engine_completed
+    assert bundle.closed
+    assert not path.exists()
+    assert not handler.guided_requests.bundles
     handler.shutdown()
 
 
@@ -1183,7 +1329,7 @@ def test_async_video_generation_with_audio_bypasses_base64(test_client, mocker: 
 
     engine = test_client.app.state.openai_serving_video._engine_client
 
-    async def _generate(prompt, request_id, sampling_params_list):
+    async def _generate(prompt, request_id, sampling_params_list, **kwargs):
         engine.captured_prompt = prompt
         engine.captured_sampling_params_list = sampling_params_list
         yield MockVideoResult([object()], audios=[object()], sample_rate=48000)
@@ -1881,7 +2027,7 @@ def test_model_reported_fps_wins_when_request_fps_omitted(test_client, mocker: M
 
     engine = test_client.app.state.openai_serving_video._engine_client
 
-    async def _generate(prompt, request_id, sampling_params_list):
+    async def _generate(prompt, request_id, sampling_params_list, **kwargs):
         engine.captured_prompt = prompt
         engine.captured_sampling_params_list = sampling_params_list
         result = MockVideoResult([object()])
@@ -2076,7 +2222,7 @@ def test_worker_fps_multiplier_is_applied_to_async_encoding(test_client, mocker:
     fps_values = []
     engine = test_client.app.state.openai_serving_video._engine_client
 
-    async def _generate(prompt, request_id, sampling_params_list):
+    async def _generate(prompt, request_id, sampling_params_list, **kwargs):
         engine.captured_prompt = prompt
         engine.captured_sampling_params_list = sampling_params_list
         import numpy as np
@@ -2133,7 +2279,7 @@ def test_audio_sample_rate_comes_from_model_config(test_client, mocker: MockerFi
         ),
     )
 
-    async def _generate(prompt, request_id, sampling_params_list):
+    async def _generate(prompt, request_id, sampling_params_list, **kwargs):
         engine.captured_prompt = prompt
         engine.captured_sampling_params_list = sampling_params_list
         import numpy as np
@@ -2160,7 +2306,7 @@ def test_audio_sample_rate_comes_from_model_config(test_client, mocker: MockerFi
 def test_video_job_persists_profiler_metadata(test_client, mocker: MockerFixture):
     engine = test_client.app.state.openai_serving_video._engine_client
 
-    async def _generate(prompt, request_id, sampling_params_list):
+    async def _generate(prompt, request_id, sampling_params_list, **kwargs):
         engine.captured_prompt = prompt
         engine.captured_sampling_params_list = sampling_params_list
         yield MockVideoResult(
@@ -2192,7 +2338,7 @@ def test_video_generation_response_exposes_action_payload(mocker: MockerFixture)
         model_name="Cosmos3-8B-UVA",
     )
 
-    async def _generate(prompt, request_id, sampling_params_list):
+    async def _generate(prompt, request_id, sampling_params_list, **kwargs):
         del prompt, request_id, sampling_params_list
         import numpy as np
 
@@ -2238,7 +2384,7 @@ def test_video_generation_response_exposes_action_payload(mocker: MockerFixture)
 def test_video_job_persists_action_metadata(test_client, mocker: MockerFixture):
     engine = test_client.app.state.openai_serving_video._engine_client
 
-    async def _generate(prompt, request_id, sampling_params_list):
+    async def _generate(prompt, request_id, sampling_params_list, **kwargs):
         import numpy as np
 
         engine.captured_prompt = prompt
@@ -3014,7 +3160,7 @@ def test_sync_t2v_returns_video_bytes(test_client, mocker: MockerFixture):
 def test_sync_t2v_returns_profiler_headers(test_client, mocker: MockerFixture):
     engine = test_client.app.state.openai_serving_video._engine_client
 
-    async def _generate(prompt, request_id, sampling_params_list):
+    async def _generate(prompt, request_id, sampling_params_list, **kwargs):
         engine.captured_prompt = prompt
         engine.captured_sampling_params_list = sampling_params_list
         yield MockVideoResult(
@@ -3446,7 +3592,7 @@ def test_worker_fps_multiplier_is_applied_to_sync_encoding(test_client, mocker: 
     engine = test_client.app.state.openai_serving_video._engine_client
     fps_values = []
 
-    async def _generate(prompt, request_id, sampling_params_list):
+    async def _generate(prompt, request_id, sampling_params_list, **kwargs):
         engine.captured_prompt = prompt
         engine.captured_sampling_params_list = sampling_params_list
         yield MockVideoResult(

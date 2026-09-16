@@ -92,6 +92,24 @@ class StageRemoteFactoryContext:
     executor_class: type | None = None
 
 
+def _stage_cfg_diffusion_model_config(stage_cfg: Any) -> Any:
+    """Read ``engine_args.model_config`` off a stage config, if it has one.
+
+    Remote diffusion replicas never build an ``OmniDiffusionConfig`` in the
+    head process, so the server-owned ``model_config`` policy block has to come
+    straight from the stage config that launched them.
+    """
+
+    def _get(container: Any, key: str) -> Any:
+        if container is None:
+            return None
+        if isinstance(container, Mapping):
+            return container.get(key)
+        return getattr(container, key, None)
+
+    return _get(_get(stage_cfg, "engine_args"), "model_config")
+
+
 def _build_load_balancer_factory(policy: str) -> Callable[[], LoadBalancer]:
     try:
         normalized = LoadBalancingPolicy(policy)
@@ -1214,7 +1232,10 @@ class DistStageRuntime(StageRuntime):
         metadata.replica_id = replica_id
 
         if ctx.stage_type == "diffusion":
-            from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
+            from vllm_omni.diffusion.stage_diffusion_client import (
+                StageDiffusionClient,
+                diffusion_model_config_snapshot,
+            )
 
             resources = None
             try:
@@ -1244,6 +1265,7 @@ class DistStageRuntime(StageRuntime):
                 metadata,
                 request_address=resources.addresses.inputs[0],
                 response_address=resources.addresses.outputs[0],
+                model_config=diffusion_model_config_snapshot(_stage_cfg_diffusion_model_config(ctx.stage_cfg)),
             )
             logger.info(
                 "[DistStageRuntime] Remote diffusion replica attached stage=%d replica=%d",

@@ -710,7 +710,7 @@ class TestSerialEngineOperations:
         assert len(results) == 1
         assert results[0].error == "rank0"
 
-    def test_collective_rpc_all_rank_status_error_propagation(self):
+    def test_collective_rpc_all_rank_status_error_propagation(self, caplog):
         engine, _, _, res_q = _make_engine(num_gpus=2)
 
         res_q.put(
@@ -725,18 +725,24 @@ class TestSerialEngineOperations:
                         "ok": False,
                         "error": "rank1 boom",
                         "error_type": "RuntimeError",
-                        "traceback": "rank1 traceback",
+                        "traceback": 'File "/opt/worker/diffusion_worker.py", line 42, in add_lora',
                     },
                 ],
             }
         )
 
-        with pytest.raises(RuntimeError) as excinfo:
-            engine.collective_rpc("add_lora")
+        with caplog.at_level("ERROR"):
+            with pytest.raises(RuntimeError) as excinfo:
+                engine.collective_rpc("add_lora")
         error = str(excinfo.value)
         assert "rank 1" in error
         assert "rank1 boom" in error
-        assert "rank1 traceback" in error
+        # ``api_server`` echoes ``str(exc)`` for 500s too, so the worker
+        # traceback must stay server-side.
+        assert "diffusion_worker.py" not in error
+        assert "Traceback" not in error
+        assert "diffusion_worker.py" in caplog.text
+        assert "add_lora" in caplog.text
 
     def test_collective_rpc_all_rank_bool_false_is_aggregated(self):
         engine, _, _, res_q = _make_engine(num_gpus=2)

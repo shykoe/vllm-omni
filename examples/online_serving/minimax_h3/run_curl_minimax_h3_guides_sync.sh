@@ -48,7 +48,13 @@ echo "This will block until generation completes."
 
 START_TIME=$(date +%s)
 
-curl -X POST "${BASE_URL}/v1/videos/sync" \
+# Write to a temporary file: with --fail-with-body curl still writes the error
+# body, so renaming only on success keeps a JSON 4xx/5xx payload from being
+# saved as a playable-looking .mp4.
+TMP_OUTPUT="$(mktemp "${OUTPUT_PATH}.XXXXXX")"
+trap 'rm -f "${TMP_OUTPUT}"' EXIT
+
+if ! curl --fail-with-body --silent --show-error -X POST "${BASE_URL}/v1/videos/sync" \
   -F "prompt=${PROMPT}" \
   -F "width=864" \
   -F "height=480" \
@@ -63,8 +69,17 @@ curl -X POST "${BASE_URL}/v1/videos/sync" \
   -F "guide_files=@${INPUT_DIR}/h3_frame_ref_2.png" \
   -F "guide_files=@${INPUT_DIR}/h3_frame_ref_3.png" \
   -F "guide_files=@${INPUT_DIR}/h3_frame_ref_4.png" \
-  -o "${OUTPUT_PATH}" \
-  -w "\nHTTP Status: %{http_code}\nInference Time: %header{X-Inference-Time-S}s\nRequest ID: %header{X-Request-Id}\n"
+  -o "${TMP_OUTPUT}" \
+  -w "\nHTTP Status: %{http_code}\nInference Time: %header{X-Inference-Time-S}s\nRequest ID: %header{X-Request-Id}\n"; then
+  echo ""
+  echo "Video generation request failed; response body:"
+  cat "${TMP_OUTPUT}"
+  echo ""
+  exit 1
+fi
+
+mv "${TMP_OUTPUT}" "${OUTPUT_PATH}"
+trap - EXIT
 
 END_TIME=$(date +%s)
 WALL_CLOCK=$((END_TIME - START_TIME))

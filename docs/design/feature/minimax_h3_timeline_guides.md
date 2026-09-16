@@ -43,7 +43,7 @@ All paths below are repository-relative.
 | Admission and lifetime | `vllm_omni/entrypoints/openai/video/generation/guided_lifetime.py`: `GuidedRequestLifetime`, `GuidedRequestBundle`, `GUIDED_JOBS` | Capacity, strongly owned tasks, abandonment, storage serialization and cleanup |
 | Serving boundary | `vllm_omni/entrypoints/openai/serving_video.py`, `vllm_omni/entrypoints/openai/api_server.py` | H3 capability, sampling transport, engine completion evidence, routes and shutdown |
 | CPU policy and decoding | `vllm_omni/model_executor/models/minimax_h3/timeline_guides.py` | Shared configuration parser, descriptors, placement, subprocess limits and media normalization |
-| Model integration | `vllm_omni/diffusion/models/minimax_h3/pipeline_minimax_h3.py` | Effective-profile checks, encoding, row budgets, anchors, request/step preparation |
+| Model integration | `vllm_omni/diffusion/models/minimax_h3/pipeline_minimax_h3.py`, `vllm_omni/diffusion/models/minimax_h3/timeline_guide_encoding.py`, `vllm_omni/diffusion/models/minimax_h3/distributed_errors.py` | Effective-profile checks, encoding, row budgets, anchors, request/step preparation, cross-rank error agreement |
 | Layout | `vllm_omni/diffusion/models/minimax_h3/packed_sequence.py`: `minimax_h3_packed_sequence_ref2va_blocks` | Physical row order, coordinates, masks, tags and spans |
 | Split-stage adapter | `vllm_omni/model_executor/stage_input_processors/minimax_h3.py` | Preserve guide sampling extras without adding Qwen inputs |
 | RPC error transport | `vllm_omni/diffusion/data.py`, `vllm_omni/diffusion/worker/diffusion_worker.py`, `vllm_omni/diffusion/executor/multiproc_executor.py` | Preserve typed errors and collect terminal rank replies |
@@ -284,6 +284,16 @@ added. Unknown keys fail. Budget fields must be strict positive integers;
 `subprocess_timeout_seconds` accepts a finite positive integer or float.
 Booleans, zero, negative and unlimited values fail.
 
+Out-of-process diffusion stages keep the real `OmniDiffusionConfig` in the
+worker, so `StageDiffusionClient` carries a sanitized, deep-copied
+`model_config` snapshot (`diffusion_model_config`) that the head process reads
+through `AsyncOmniEngine.get_diffusion_od_config()`. Without it a split
+deployment would silently fall back to the defaults in this table. The snapshot
+is deliberately not exposed as `od_config`: `AsyncOmni.get_diffusion_od_config()`
+returns the first client-level `od_config` it finds, and a partial object there
+would regress `model`, `revision` and capability lookups. A malformed snapshot
+now fails guided requests loudly instead of reverting to defaults.
+
 | Field | Default | Unit or meaning |
 | --- | ---: | --- |
 | `max_entries` | 8 | Manifest occurrences |
@@ -420,6 +430,9 @@ combination the runtime can schedule.
 checks active/fused adapters, FastH3, distilled schedules, effective quality
 cache policy, and the actual attention modules, including role-specific/token
 refiner attention. Looking only at the default backend name is insufficient.
+It lives with `_check_timeline_rows()` and `_encode_timeline_guides()` in
+`MiniMaxH3TimelineGuideMixin` (`timeline_guide_encoding.py`), which the pipeline
+composes; method names and call sites are unchanged.
 
 `quality=high` can activate Cache-DiT even when startup caching was disabled.
 Conversely, a startup Cache-DiT configuration is not itself proof that a
@@ -448,6 +461,15 @@ residency/offload context exits. A rank-zero-only error broadcast is insufficien
 it would discard a rank-1 cleanup error and strand healthy ranks in the next
 tensor transfer. Rank-zero-only preparation retains its separate helper.
 
+The helper evaluates every failed rank before raising. An unknown/fatal failure
+on any rank outranks a 4xx on a lower rank, matching the rule
+`MultiprocDiffusionExecutor._unwrap_rpc_result_envelope()` already enforces;
+only when every failed rank reports a 4xx may a client error be raised. This
+matters beyond error text: the serving boundary treats an origin-qualified 4xx
+as proof of a clean worker rejection and releases guided uploads, so a masked
+fatal failure would delete inputs while another rank is in an unknown state.
+The client message names the selected rank only; other failed ranks are logged.
+
 This coordinates errors after native collectives return. It does not claim
 recovery from a lost process or a hang inside a native collective.
 
@@ -473,7 +495,7 @@ request or a deleted-but-running async request must still consume capacity.
 | `descriptors` | Ordered trusted guide metadata |
 | `task` | Strongly owned inner generation task |
 | `started` | Inner coroutine entered; not proof of engine dispatch |
-| `engine_started` | Serving crossed the engine submission boundary |
+| `engine_started` | EngineCore accepted the request (set from `generate()`'s `on_engine_admitted` callback, not on coroutine entry) |
 | `engine_completed` | Serving observed qualified completion evidence |
 | `abandoned` | Result must not be published, independently of GPU progress |
 | `closed` | Bundle cleanup/admission release has run |
@@ -545,6 +567,11 @@ surfacing an error. If any participating failure is unknown, it must not be
 misclassified as a safe client rejection merely because another rank returned
 a 4xx. No exception-name string matching is used to establish safety.
 
+Worker tracebacks stay server-side. `api_server` echoes `str(exc)` for 5xx as
+well as 4xx, so `_unwrap_rpc_result_envelope()` logs the per-rank tracebacks
+with the RPC method and failing ranks and raises only the sanitized
+rank/type/message summary.
+
 ### Unknown failures and shutdown
 
 After dispatch, an unknown/fatal error without completion evidence retains both
@@ -552,6 +579,16 @@ files and admission slots. Unexpected inner-task cancellation also retains
 them, even when a lower layer swallowed cancellation and returned normally.
 The async wrapper returning successfully after storing a failed job does not
 override the serving boundary's completion flags.
+
+"After dispatch" means after EngineCore accepted the request.
+`AsyncOmni.generate()` invokes the optional `on_engine_admitted` callback
+exactly once, immediately after `add_request_async()` (or after the first
+streaming chunk is submitted), and the serving boundary sets `engine_started`
+from it. Failures that happen after the generator is entered but before
+submission — an asleep engine, the diffusion list-prompt rejection, sampling
+resolution — leave `engine_started` false, so those bundles close and their
+uploads and admission slots are released. Nothing is queued in any worker at
+that point, so retention would leak both.
 
 `drain()` stops new admission, abandons output, closes unsubmitted work and
 shields a gather of submitted tasks. Repeated shutdown cancellation cannot exit

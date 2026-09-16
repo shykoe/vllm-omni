@@ -106,5 +106,18 @@ while true; do
   esac
 done
 
-curl -sS -L "${BASE_URL}/v1/videos/${video_id}/content" -o "${OUTPUT_PATH}"
+# Download to a temporary file so an HTTP error body is never renamed into a
+# .mp4 that looks like a successful result.
+TMP_OUTPUT="$(mktemp "${OUTPUT_PATH}.XXXXXX")"
+trap 'rm -f "${TMP_OUTPUT}"' EXIT
+
+if ! curl --fail-with-body --silent --show-error -L "${BASE_URL}/v1/videos/${video_id}/content" -o "${TMP_OUTPUT}"; then
+  echo "Failed to download video content for job ${video_id}:"
+  cat "${TMP_OUTPUT}"
+  echo ""
+  exit 1
+fi
+
+mv "${TMP_OUTPUT}" "${OUTPUT_PATH}"
+trap - EXIT
 echo "Saved video to ${OUTPUT_PATH}"

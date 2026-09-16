@@ -34,6 +34,24 @@ def _turbo_spec(filename: str) -> TurboSpec:
     return spec
 
 
+def _patch_dit_helper(monkeypatch, name, value):
+    """Patch a shared DiT helper in every module that resolves it.
+
+    ``distributed_errors`` owns ``_dit_rank_world``,
+    ``_broadcast_rank0_exception``, ``_synchronize_any_rank_exception`` and
+    ``_broadcast_tensor``; ``pipeline_minimax_h3`` and
+    ``timeline_guide_encoding`` each bind their own module-global reference.
+    """
+    from vllm_omni.diffusion.models.minimax_h3 import (
+        distributed_errors,
+        pipeline_minimax_h3,
+        timeline_guide_encoding,
+    )
+
+    for module in (distributed_errors, pipeline_minimax_h3, timeline_guide_encoding):
+        monkeypatch.setattr(module, name, value)
+
+
 def test_decode_to_mp4_batches_consumer_transfers(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
 
@@ -337,7 +355,7 @@ def test_timeline_reused_source_charges_shared_decode_budget_before_vae(monkeypa
 def test_timeline_all_decoders_share_one_request_budget(monkeypatch):
     from PIL import Image
 
-    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.diffusion.models.minimax_h3 import timeline_guide_encoding as guide_mod
     from vllm_omni.model_executor.models.minimax_h3.timeline_guides import TimelineGuideLimits
 
     pipeline = _timeline_pipeline(monkeypatch)
@@ -358,9 +376,9 @@ def test_timeline_all_decoders_share_one_request_budget(monkeypatch):
         budget.add_audio(1600)
         return np.zeros((2, 800), np.float32), 32000
 
-    monkeypatch.setattr(mod, "decode_guide_image", decode_image)
-    monkeypatch.setattr(mod, "decode_guide_video", decode_video)
-    monkeypatch.setattr(mod, "decode_guide_audio", decode_audio)
+    monkeypatch.setattr(guide_mod, "decode_guide_image", decode_image)
+    monkeypatch.setattr(guide_mod, "decode_guide_video", decode_video)
+    monkeypatch.setattr(guide_mod, "decode_guide_audio", decode_audio)
     pipeline.video_vae.encode_video = Mock(return_value=(torch.ones(8, 96), (2, 4, 4)))
     pipeline.audio_vae.encode_waveform = Mock(return_value=(torch.ones(2, 32), 1))
     pipeline._encode_timeline_guides(
@@ -420,15 +438,17 @@ def test_timeline_shape_validation_errors_are_client_errors_only_for_guides(monk
 def test_timeline_clip_audio_order_and_channel_major_crop(monkeypatch):
     from PIL import Image
 
-    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.diffusion.models.minimax_h3 import timeline_guide_encoding as guide_mod
     from vllm_omni.model_executor.models.minimax_h3.timeline_guides import TimelineGuideLimits
 
     pipeline = _timeline_pipeline(monkeypatch)
     events = []
     frames = [Image.new("RGB", (64, 64), (index, 2 * index, 3 * index)) for index in range(22)]
-    monkeypatch.setattr(mod, "decode_guide_video", lambda *args, **kwargs: frames)
-    monkeypatch.setattr(mod, "decode_guide_image", lambda *args, **kwargs: frames[0])
-    monkeypatch.setattr(mod, "decode_guide_audio", lambda *args, **kwargs: (np.zeros((2, 8000), np.float32), 32000))
+    monkeypatch.setattr(guide_mod, "decode_guide_video", lambda *args, **kwargs: frames)
+    monkeypatch.setattr(guide_mod, "decode_guide_image", lambda *args, **kwargs: frames[0])
+    monkeypatch.setattr(
+        guide_mod, "decode_guide_audio", lambda *args, **kwargs: (np.zeros((2, 8000), np.float32), 32000)
+    )
 
     def encode_video(value):
         assert isinstance(value, np.ndarray)
@@ -561,13 +581,14 @@ def test_timeline_forward_fanout_preserves_raw_and_muxed_outputs(monkeypatch, tm
 
 def test_timeline_audio_only_has_no_ref2va_minimum(monkeypatch, tmp_path):
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.diffusion.models.minimax_h3 import timeline_guide_encoding as guide_mod
 
     pipeline = _timeline_pipeline(monkeypatch)
     sampling = _timeline_sampling(tmp_path)
     descriptor = sampling.extra_args[mod.GUIDES_EXTRA_KEY][0]
     descriptor["audio"] = descriptor.pop("image")
     descriptor["frame_index"] = -1
-    monkeypatch.setattr(mod, "decode_guide_audio", lambda *args, **kwargs: (np.zeros((1, 80), np.float32), 32000))
+    monkeypatch.setattr(guide_mod, "decode_guide_audio", lambda *args, **kwargs: (np.zeros((1, 80), np.float32), 32000))
     pipeline.audio_vae.encode_waveform = Mock(return_value=(torch.ones(2, 32), 1))
     context = pipeline._prepare_request_inputs(prompt="audio only", multi_modal_data={}, sampling=sampling)
     assert context["task"] == "t2va"
@@ -639,17 +660,17 @@ def test_timeline_guide_row_limit_precedes_vae(monkeypatch, tmp_path):
 
 
 def test_timeline_rank_zero_decode_error_precedes_tensor_collectives(monkeypatch):
-    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.diffusion.models.minimax_h3 import timeline_guide_encoding as guide_mod
     from vllm_omni.errors import OmniClientError
     from vllm_omni.model_executor.models.minimax_h3.timeline_guides import TimelineGuideLimits
 
     pipeline = _timeline_pipeline(monkeypatch)
-    monkeypatch.setattr(mod, "_dit_rank_world", lambda: (None, 0, 2))
+    _patch_dit_helper(monkeypatch, "_dit_rank_world", lambda: (None, 0, 2))
     broadcast = Mock()
-    monkeypatch.setattr(mod.dist, "broadcast_object_list", broadcast)
+    monkeypatch.setattr(guide_mod.dist, "broadcast_object_list", broadcast)
     tensor_broadcast = Mock(side_effect=AssertionError("must agree on preparation failure first"))
-    monkeypatch.setattr(mod, "_broadcast_tensor", tensor_broadcast)
-    monkeypatch.setattr(mod, "decode_guide_image", Mock(side_effect=ValueError("bad guide image")))
+    _patch_dit_helper(monkeypatch, "_broadcast_tensor", tensor_broadcast)
+    monkeypatch.setattr(guide_mod, "decode_guide_image", Mock(side_effect=ValueError("bad guide image")))
     with pytest.raises(OmniClientError, match="bad guide image"):
         pipeline._encode_timeline_guides(
             [{"frame_index": 36, "image": "broken"}],
@@ -666,7 +687,7 @@ def test_timeline_rank_zero_decode_error_precedes_tensor_collectives(monkeypatch
 def test_timeline_distributed_video_encode_uses_manifest_order(monkeypatch):
     from PIL import Image
 
-    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.diffusion.models.minimax_h3 import timeline_guide_encoding as guide_mod
     from vllm_omni.model_executor.models.minimax_h3.timeline_guides import TimelineGuideLimits
 
     pipeline = _timeline_pipeline(monkeypatch)
@@ -676,12 +697,16 @@ def test_timeline_distributed_video_encode_uses_manifest_order(monkeypatch):
         for index in (36, 0, 36)
     ]
     wire = iter([blocks, frames, frames, frames])
-    monkeypatch.setattr(mod, "_dit_rank_world", lambda: (None, 1, 2))
-    monkeypatch.setattr(mod, "_broadcast_rank0_exception", lambda error: None)
-    monkeypatch.setattr(mod.dist, "all_gather_object", Mock())
-    monkeypatch.setattr(mod.dist, "broadcast_object_list", lambda payload, **kwargs: payload.__setitem__(0, next(wire)))
-    monkeypatch.setattr(mod, "_broadcast_tensor", lambda rows, **kwargs: rows)
-    monkeypatch.setattr(mod, "decode_guide_video", Mock(side_effect=AssertionError("nonzero rank must not decode")))
+    _patch_dit_helper(monkeypatch, "_dit_rank_world", lambda: (None, 1, 2))
+    _patch_dit_helper(monkeypatch, "_broadcast_rank0_exception", lambda error: None)
+    monkeypatch.setattr(guide_mod.dist, "all_gather_object", Mock())
+    monkeypatch.setattr(
+        guide_mod.dist, "broadcast_object_list", lambda payload, **kwargs: payload.__setitem__(0, next(wire))
+    )
+    _patch_dit_helper(monkeypatch, "_broadcast_tensor", lambda rows, **kwargs: rows)
+    monkeypatch.setattr(
+        guide_mod, "decode_guide_video", Mock(side_effect=AssertionError("nonzero rank must not decode"))
+    )
     pipeline.video_vae.is_distributed_enabled = lambda: True
     pipeline.video_vae.encode_video = Mock(return_value=(torch.ones(8, 96), (2, 4, 4)))
     result = pipeline._encode_timeline_guides(
@@ -707,6 +732,7 @@ def test_guided_distributed_vae_agrees_on_nonzero_failure_after_cleanup(monkeypa
     from PIL import Image
 
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.diffusion.models.minimax_h3 import timeline_guide_encoding as guide_mod
     from vllm_omni.model_executor.models.minimax_h3.timeline_guides import TimelineGuideLimits
 
     frames = [Image.new("RGB", (64, 64)) for _ in range(5)]
@@ -759,14 +785,14 @@ def test_guided_distributed_vae_agrees_on_nonzero_failure_after_cleanup(monkeypa
             if rank == 1:
                 payload[0] = next(wire)
 
-        monkeypatch.setattr(mod, "_dit_rank_world", lambda: ("dit", rank, 2))
-        monkeypatch.setattr(mod, "_broadcast_rank0_exception", lambda error: None)
+        monkeypatch.setattr(mod, "load_video_frames", lambda path: frames)
+        _patch_dit_helper(monkeypatch, "_dit_rank_world", lambda: ("dit", rank, 2))
+        _patch_dit_helper(monkeypatch, "_broadcast_rank0_exception", lambda error: None)
         monkeypatch.setattr(mod.dist, "broadcast_object_list", broadcast)
         monkeypatch.setattr(mod.dist, "all_gather_object", agree)
         transfer = Mock(side_effect=AssertionError("must not transfer rows after a peer failure"))
-        monkeypatch.setattr(mod, "_broadcast_tensor", transfer)
-        monkeypatch.setattr(mod, "decode_guide_video", lambda *args, **kwargs: frames)
-        monkeypatch.setattr(mod, "load_video_frames", lambda path: frames)
+        _patch_dit_helper(monkeypatch, "_broadcast_tensor", transfer)
+        monkeypatch.setattr(guide_mod, "decode_guide_video", lambda *args, **kwargs: frames)
         monkeypatch.setattr(pipeline, "_component_on_device", component_context)
         pipeline.video_vae.is_distributed_enabled = lambda: True
         pipeline.video_vae.encode_video = Mock(side_effect=encode_video)
@@ -798,7 +824,7 @@ def test_any_rank_vae_failure_preserves_client_status(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
     from vllm_omni.errors import OmniClientError
 
-    monkeypatch.setattr(mod, "_dit_rank_world", lambda: ("dit", 0, 2))
+    _patch_dit_helper(monkeypatch, "_dit_rank_world", lambda: ("dit", 0, 2))
 
     def agree(errors, local_error, **kwargs):
         assert local_error is None
@@ -813,6 +839,63 @@ def test_any_rank_vae_failure_preserves_client_status(monkeypatch):
     with pytest.raises(OmniClientError, match=r"\[rank 1\].*invalid latent shape") as error:
         mod._synchronize_any_rank_exception(None)
     assert error.value.status_code == 400
+
+
+def _rank_error(error_type, message, status_code=None):
+    return {
+        "type": error_type,
+        "message": message,
+        "status_code": status_code,
+        "error_type": "invalid_request_error" if status_code is not None else None,
+    }
+
+
+@pytest.mark.parametrize("fatal_rank", [0, 1])
+def test_fatal_rank_failure_outranks_client_error_on_another_rank(monkeypatch, caplog, fatal_rank):
+    """A 4xx on one rank must not mask an unknown failure on another rank.
+
+    The serving boundary treats an origin-qualified 4xx as a clean worker
+    rejection and releases guided uploads, so a masked fatal failure would
+    delete inputs while that rank is still in an unknown state.
+    """
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.errors import OmniClientError
+
+    _patch_dit_helper(monkeypatch, "_dit_rank_world", lambda: ("dit", 0, 2))
+    reported = [None, None]
+    reported[fatal_rank] = _rank_error("RuntimeError", "worker crashed")
+    reported[1 - fatal_rank] = _rank_error("OmniClientError", "invalid latent shape", 400)
+
+    monkeypatch.setattr(
+        mod.dist, "all_gather_object", lambda errors, local, **kw: errors.__setitem__(slice(None), reported)
+    )
+    with caplog.at_level("ERROR"):
+        with pytest.raises(RuntimeError) as error:
+            mod._synchronize_any_rank_exception(None)
+    assert not isinstance(error.value, OmniClientError)
+    assert f"[rank {fatal_rank}] RuntimeError: worker crashed" == str(error.value)
+    # The other failed rank belongs in the operator log, not the client message.
+    assert "invalid latent shape" not in str(error.value)
+    assert "invalid latent shape" in caplog.text
+
+
+def test_all_client_rank_failures_still_yield_the_lowest_rank_4xx(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.errors import OmniClientError
+
+    _patch_dit_helper(monkeypatch, "_dit_rank_world", lambda: ("dit", 0, 2))
+    reported = [
+        _rank_error("OmniClientError", "first rejection", 400),
+        _rank_error("OmniClientError", "second rejection", 422),
+    ]
+
+    monkeypatch.setattr(
+        mod.dist, "all_gather_object", lambda errors, local, **kw: errors.__setitem__(slice(None), reported)
+    )
+    with pytest.raises(OmniClientError) as error:
+        mod._synchronize_any_rank_exception(None)
+    assert error.value.status_code == 400
+    assert str(error.value) == "[rank 0] OmniClientError: first rejection"
 
 
 def test_timeline_guides_do_not_substitute_for_ref2va_references(monkeypatch, tmp_path):

@@ -288,14 +288,24 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 f"rank {status.get('rank')}: {status.get('error_type') or 'Error'}: {status.get('error')}"
                 for status in failed
             )
+            method = response.get("method", "<unknown>")
             tracebacks = "\n\n".join(
                 f"rank {status.get('rank')} traceback:\n{status['traceback']}"
                 for status in failed
                 if status.get("traceback")
             )
             if tracebacks:
-                details = f"{details}\n\n{tracebacks}"
-            method = response.get("method", "<unknown>")
+                # Tracebacks are operator diagnostics, not client output:
+                # ``api_server`` echoes ``str(exc)`` for 4xx *and* 5xx, so any
+                # traceback appended to the message would leak worker file
+                # paths and source lines to the HTTP client.
+                logger.error(
+                    "RPC '%s' failed on worker rank(s) %s: %s\n\n%s",
+                    method,
+                    [status.get("rank") for status in failed],
+                    details,
+                    tracebacks,
+                )
             # An unknown failure on any rank must not become a safe 4xx.
             client_failure = all(is_client_error_status(status.get("error_status_code")) for status in failed)
             raise_client_error_or(

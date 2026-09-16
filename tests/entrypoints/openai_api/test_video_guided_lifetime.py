@@ -526,6 +526,9 @@ async def test_actual_serving_methods_release_terminal_errors_and_retain_engine_
     async def generate(**kwargs):
         nonlocal error
         assert kwargs["sampling_params_list"][0].extra_args["_minimax_h3_timeline_guides"][0]["frame_index"] == 100000
+        # Model a request EngineCore actually accepted; every failure below is
+        # a post-submission engine failure.
+        kwargs["on_engine_admitted"]()
         if terminal_origin:
             request_id = kwargs["request_id"]
             orchestrator = SimpleNamespace(

@@ -589,6 +589,7 @@ def test_broadcast_rank0_exception_single_rank_reraises():
 
 def test_broadcast_rank0_exception_propagates_to_non_zero_ranks(monkeypatch):
     """A rank-0 error becomes a matching client error on every other DiT rank."""
+    from vllm_omni.diffusion.models.minimax_h3 import distributed_errors
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
     from vllm_omni.errors import OmniClientError
 
@@ -601,7 +602,9 @@ def test_broadcast_rank0_exception_propagates_to_non_zero_ranks(monkeypatch):
 
         return fake_broadcast
 
-    monkeypatch.setattr(mod, "_dit_rank_world", fake_rank_world(0))
+    # ``_broadcast_rank0_exception`` lives in ``distributed_errors`` and resolves
+    # ``_dit_rank_world`` from that module's globals.
+    monkeypatch.setattr(distributed_errors, "_dit_rank_world", fake_rank_world(0))
     err = OmniClientError("invalid reference-video file", status_code=422, error_type="UnprocessableEntityError")
     rank0_payload = {
         "type": type(err).__name__,
@@ -614,7 +617,7 @@ def test_broadcast_rank0_exception_propagates_to_non_zero_ranks(monkeypatch):
         mod._broadcast_rank0_exception(err)
     assert rank0_info.value is err
 
-    monkeypatch.setattr(mod, "_dit_rank_world", fake_rank_world(2))
+    monkeypatch.setattr(distributed_errors, "_dit_rank_world", fake_rank_world(2))
     with pytest.raises(OmniClientError) as rank2_info:
         mod._broadcast_rank0_exception(None)
     assert rank2_info.value.status_code == 422

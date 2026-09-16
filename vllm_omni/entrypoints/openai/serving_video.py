@@ -720,13 +720,25 @@ class OmniOpenAIServingVideo:
         )
 
         result = None
+        generate_kwargs: dict[str, Any] = {}
         if guide_bundle is not None:
-            guide_bundle.engine_started = True
+            bundle = guide_bundle
+
+            # ``engine_started`` must mean "EngineCore accepted the request",
+            # not "the generate coroutine was entered". Failures before
+            # submission (asleep engine, list-prompt rejection, sampling
+            # resolution) must stay releasable so uploads and the admission
+            # slot are reclaimed.
+            def _mark_engine_admitted() -> None:
+                bundle.engine_started = True
+
+            generate_kwargs["on_engine_admitted"] = _mark_engine_admitted
         try:
             async for output in engine_client.generate(
                 prompt=prompt,
                 request_id=request_id,
                 sampling_params_list=sampling_params_list,
+                **generate_kwargs,
             ):
                 result = output
         except OmniClientError as exc:
