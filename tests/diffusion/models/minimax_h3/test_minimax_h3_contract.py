@@ -734,6 +734,51 @@ def test_timeline_distributed_video_encode_uses_manifest_order(monkeypatch):
         np.testing.assert_array_equal(call.args[0], np.stack([np.asarray(frame) for frame in frames]))
 
 
+def test_timeline_distributed_still_guides_encode_on_every_rank(monkeypatch):
+    """A patch-parallel video VAE makes ``encode_image`` collective too.
+
+    Encoding a still guide on rank zero alone would leave that rank inside the
+    codec's barrier while its peers wait in the next rank-zero broadcast.
+    """
+    from PIL import Image
+
+    from vllm_omni.diffusion.models.minimax_h3 import timeline_guide_encoding as guide_mod
+    from vllm_omni.model_executor.models.minimax_h3.timeline_guides import TimelineGuideLimits
+
+    pipeline = _timeline_pipeline(monkeypatch)
+    still = Image.new("RGB", (64, 64))
+    blocks = [{"kind": "image", "frame_index": 36, "latent_t": 1, "latent_h": 4, "latent_w": 4, "ref_audio_t": 0}]
+    wire = iter([blocks, [still]])
+    _patch_dit_helper(monkeypatch, "_dit_rank_world", lambda: (None, 1, 2))
+    rank_zero_agreement = Mock()
+    _patch_dit_helper(monkeypatch, "_broadcast_rank0_exception", rank_zero_agreement)
+    any_rank_agreement = Mock()
+    monkeypatch.setattr(guide_mod.dist, "all_gather_object", any_rank_agreement)
+    monkeypatch.setattr(
+        guide_mod.dist, "broadcast_object_list", lambda payload, **kwargs: payload.__setitem__(0, next(wire))
+    )
+    _patch_dit_helper(monkeypatch, "_broadcast_tensor", lambda rows, **kwargs: rows)
+    monkeypatch.setattr(
+        guide_mod, "decode_guide_image", Mock(side_effect=AssertionError("nonzero rank must not decode"))
+    )
+    pipeline.video_vae.is_distributed_enabled = lambda: True
+
+    result = pipeline._encode_timeline_guides(
+        [{"frame_index": 36, "image": "still"}],
+        width=64,
+        height=64,
+        num_frames=124,
+        limits=TimelineGuideLimits(),
+        other_rows=1,
+    )
+
+    pipeline.video_vae.encode_image.assert_called_once_with(still)
+    assert result[2] == [(1, 4, 4)] and result[1].shape == (4, 96)
+    # The codec phase agrees across every participant, not just rank zero.
+    any_rank_agreement.assert_called_once()
+    rank_zero_agreement.assert_called_once()
+
+
 @pytest.mark.parametrize("failure_phase", ["encode", "cleanup"])
 def test_guided_distributed_vae_agrees_on_nonzero_failure_after_cleanup(monkeypatch, failure_phase):
     from contextlib import contextmanager

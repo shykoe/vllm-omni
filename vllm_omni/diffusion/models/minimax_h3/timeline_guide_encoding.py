@@ -182,12 +182,16 @@ class MiniMaxH3TimelineGuideMixin:
 
         visual_parts, audio_parts = [], []
         visual_shapes, audio_lengths = [], []
-        distributed_video = any("video" in item for item in descriptors) and self.video_vae.is_distributed_enabled()
+        # A patch-parallel video VAE runs collectives inside ``encode_image`` as
+        # well as ``encode_video``, so participation follows the codec, never
+        # the guide's modality. Encoding a still on rank 0 alone would strand
+        # its peers in the next broadcast. The audio WVAE has no such group.
+        distributed_video = self.video_vae.is_distributed_enabled()
         for index, block in enumerate(blocks):
             if block["kind"] != "audio":
                 frames = decoded[index]["frames"] if rank == 0 else None
                 is_clip = "video" in descriptors[index]
-                if distributed_video and is_clip:
+                if distributed_video:
                     payload = [frames]
                     dist.broadcast_object_list(payload, src=0, group=group)
                     frames = payload[0]
@@ -195,7 +199,7 @@ class MiniMaxH3TimelineGuideMixin:
                 encode_error = None
                 shape = (block["latent_t"], block["latent_h"], block["latent_w"])
                 try:
-                    if rank == 0 or (distributed_video and is_clip):
+                    if rank == 0 or distributed_video:
                         with self._component_on_device(self.video_vae):
                             if is_clip:
                                 video_frames = np.stack([np.asarray(frame) for frame in frames])
@@ -211,7 +215,7 @@ class MiniMaxH3TimelineGuideMixin:
                             raise OmniClientError("timeline guide visual VAE returned an unexpected row shape")
                 except Exception as exc:
                     encode_error = exc
-                if distributed_video and is_clip:
+                if distributed_video:
                     _synchronize_any_rank_exception(encode_error)
                 else:
                     _broadcast_rank0_exception(encode_error)
