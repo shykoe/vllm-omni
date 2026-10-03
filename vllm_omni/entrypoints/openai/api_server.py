@@ -191,6 +191,7 @@ from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type
 from vllm_omni.entrypoints.openai.video.generation.helpers import (
     VIDEO_SYNC_TIMEOUT_S,
+    _cleanup_timeline_guides,
     _cleanup_video_references,
     _parse_video_form,
     _run_video_generation_job,
@@ -2783,6 +2784,7 @@ async def create_video_sync(
         ) from exc
     finally:
         _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
+        _cleanup_timeline_guides(request)
     inference_time_s = time.perf_counter() - started_at
 
     return Response(
