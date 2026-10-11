@@ -3072,18 +3072,11 @@ class MiniMaxH3Pipeline(
         keyframe_frame_indices = list(conditioning.keyframe_frame_indices) or None
         guide_blocks = None
         if conditioning.guide_blocks:
-            if (
-                continuation is not None
-                or latent_refine is not None
-                or upscale_target is not None
-                or locked_audio_rows is not None
-                or conditioning.video_edit_clean_rows is not None
-                or conditioning.audio_edit_clean_rows is not None
-            ):
-                raise OmniClientError(
-                    "MiniMax H3 timeline guides do not support continuation, latent refine/upscale, "
-                    "latent-mask editing, or audio_mode=lock_source"
-                )
+            # Continuation, latent-mask editing and audio_mode=lock_source are
+            # rejected by prepare_encoder_inputs before any guide is decoded;
+            # guides are only produced there, from this request's extra_args.
+            if latent_refine is not None or upscale_target is not None:
+                raise OmniClientError("MiniMax H3 timeline guides do not support latent refine/upscale")
             self._validate_timeline_guide_sampling(
                 sampling,
                 task,
