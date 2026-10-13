@@ -2693,6 +2693,7 @@ async def create_video(
 
     def _cleanup_request_resources() -> None:
         _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
+        _cleanup_timeline_guides(request)
 
     task: asyncio.Task[None] | None = None
     ref = None

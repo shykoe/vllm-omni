@@ -1550,6 +1550,44 @@ def test_h3_timeline_guide_persistence_failure_cleans_prior_uploads(test_client,
     assert persisted and not Path(persisted[0]).exists()
 
 
+@pytest.mark.parametrize("failure", ["registration_error", "cancelled_before_start"])
+def test_create_video_cleans_timeline_guides_when_job_never_starts(test_client, monkeypatch, failure):
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
+    persisted: list[str] = []
+    original_persist = video_generation_helpers._persist_uploaded_reference
+
+    async def recording_persist(upload, **kwargs):
+        path = await original_persist(upload, **kwargs)
+        persisted.append(path)
+        return path
+
+    monkeypatch.setattr(video_generation_helpers, "_persist_uploaded_reference", recording_persist)
+    original_upsert = api_server.VIDEO_TASKS.upsert
+
+    async def failing_upsert(video_id, task):
+        if failure == "registration_error":
+            raise RuntimeError("task registry unavailable")
+        # The job coroutine never starts, so its own finally block cannot clean up.
+        task.cancel()
+        await original_upsert(video_id, task)
+
+    monkeypatch.setattr(api_server.VIDEO_TASKS, "upsert", failing_upsert)
+    manifest = [{"frame_index": 0, "video": {"upload_index": 0}, "audio": {"upload_index": 1}}]
+    request_kwargs = {
+        "data": {"prompt": "guide", "timeline_guides": json.dumps(manifest)},
+        "files": _guide_files()[1:],
+    }
+
+    if failure == "registration_error":
+        with pytest.raises(RuntimeError, match="task registry unavailable"):
+            test_client.post("/v1/videos", **request_kwargs)
+    else:
+        assert test_client.post("/v1/videos", **request_kwargs).status_code == 200
+
+    assert len(persisted) == 2
+    _wait_until(lambda: not any(Path(path).exists() for path in persisted))
+
+
 def test_h3_latent_edit_masks_without_sources_are_forwarded_to_stage0(test_client, mocker: MockerFixture):
     mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
