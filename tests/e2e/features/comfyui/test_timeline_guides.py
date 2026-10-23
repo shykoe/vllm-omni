@@ -42,6 +42,7 @@ from PIL import Image
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 PLUGIN_DIR = Path(__file__).resolve().parents[4] / "apps" / "ComfyUI-vLLM-Omni"
+GUIDE_WORKFLOW = PLUGIN_DIR / "example_workflows" / "vLLM-Omni MiniMax-H3 Timeline Guides.json"
 H3 = "MiniMaxAI/MiniMax-H3"
 WIDTH, HEIGHT = 64, 32
 
@@ -262,7 +263,7 @@ def test_saved_workflows_keep_generate_video_slots(path):
         names = [input_["name"] for input_ in node.get("inputs", [])]
         sockets = [name for name in names if name in schema["optional"]]
         assert sockets == sorted(sockets, key=order.index)
-        assert "timeline_guides" not in names
+        assert ("timeline_guides" in names) == (path == GUIDE_WORKFLOW)
         for input_ in node.get("inputs", []):
             assert input_["type"] == current[input_["name"]][0]
         assert len(node["widgets_values"]) == len(schema["required"])
