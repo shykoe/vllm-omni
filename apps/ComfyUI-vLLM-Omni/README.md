@@ -293,6 +293,11 @@ Load Video ─────video──► Add Guide (frame_index=-22) ◄──�
 Load Audio ─────audio──┘
 ```
 
+The [MiniMax-H3 Timeline Guides](example_workflows/vLLM-Omni%20MiniMax-H3%20Timeline%20Guides.json)
+template (**Templates → ComfyUI-vLLM-Omni**) wires this chain, guiding the closing
+clip with its own soundtrack through **Get Video Components → audio**. Its loader
+filenames are placeholders; select your own files.
+
 | Socket | Type | Notes |
 | --- | --- | --- |
 | `frame_index` (widget) | `INT` | Output frame where the guide starts, on the 24 FPS timeline. Negative values count from the end: `-1` is the last frame, `-22` starts a clip that ends on it. |
